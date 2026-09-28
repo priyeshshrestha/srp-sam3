@@ -123,7 +123,7 @@ def box_to_canvas(
     orig_size: Tuple[int, int],
     canvas_size: int = CANVAS_SIZE,
 ) -> Tuple[float, float, float, float]:
-    """Map a box from original-image pixels to normalised canvas coordinates.
+    """Map a box from original-image pixels to normalised centre-format canvas coordinates.
 
     Args:
         box_xywh: (x, y, w, h) in the source image's own pixel coordinates
@@ -132,9 +132,14 @@ def box_to_canvas(
         canvas_size: canvas edge length
 
     Returns:
-        (cx, cy, w, h), **centre format, normalised to [0, 1]** -- the format SAM 3's
-        `add_geometric_prompt` expects. Getting this wrong produces a box that is silently
-        valid but in the wrong place, which is far worse than a crash.
+        (cx, cy, w, h), **centre format, normalised to [0, 1]** -- what the NATIVE `sam3`
+        package expects via `processor.add_geometric_prompt(state, box=..., label=True)`.
+
+    WARNING: the two SAM 3 APIs take different box formats, and a box in the wrong format is
+    silently valid but points somewhere else entirely -- far worse than a crash. Use
+    `box_to_canvas_xyxy` for the HuggingFace `transformers` API (`Sam3Processor`), which wants
+    absolute xyxy PIXELS. See `models/canvas.py` docstring and the README for which path you
+    are on.
     """
     bx, by, bw, bh = box_xywh
     ox, oy, ow, oh = rect
@@ -147,6 +152,35 @@ def box_to_canvas(
         (py + bh * sy / 2) / canvas_size,
         (bw * sx) / canvas_size,
         (bh * sy) / canvas_size,
+    )
+
+
+def box_to_canvas_xyxy(
+    box_xywh: Tuple[float, float, float, float],
+    rect: Rect,
+    orig_size: Tuple[int, int],
+    canvas_size: int = CANVAS_SIZE,
+) -> Tuple[int, int, int, int]:
+    """Same mapping, but returning absolute xyxy PIXELS on the canvas.
+
+    This is the format the HuggingFace `transformers` API wants:
+
+        processor(images=canvas, input_boxes=[[[x1, y1, x2, y2]]],
+                  input_boxes_labels=[[1]], return_tensors="pt")
+
+    where the label is 1 for a positive exemplar and 0 for a negative one.
+    """
+    cx, cy, w, h = box_to_canvas(box_xywh, rect, orig_size, canvas_size)
+    x1 = int(round((cx - w / 2) * canvas_size))
+    y1 = int(round((cy - h / 2) * canvas_size))
+    x2 = int(round((cx + w / 2) * canvas_size))
+    y2 = int(round((cy + h / 2) * canvas_size))
+    # Clamp: a box straddling the tile edge must not address the other tile.
+    return (
+        max(0, min(x1, canvas_size - 1)),
+        max(0, min(y1, canvas_size - 1)),
+        max(1, min(x2, canvas_size)),
+        max(1, min(y2, canvas_size)),
     )
 
 
