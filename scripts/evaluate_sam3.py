@@ -367,8 +367,13 @@ def main():
     parser = argparse.ArgumentParser(description="Evaluate SAM / SAM 3 on FLAIR with ecological composites")
     parser.add_argument("--root", type=str, default="./data", help="FLAIR dataset root directory")
     parser.add_argument("--class_index", type=str, default=None, help="Path to precomputed class index JSON")
-    parser.add_argument("--composite", type=str, default="cir", choices=["rgb", "cir", "ndvi_dsm_h", "rgb_ndvi", "rgb_dsm"], help="Input composite")
-    parser.add_argument("--shannon_source", type=str, default="elevation", choices=["elevation", "ndvi"], help="Source for Shannon entropy")
+    parser.add_argument("--composite", type=str, default="cir", choices=["rgb", "cir", "ndvi_h_nir", "rgb_ndvi", "ndvi_dsm_h", "rgb_dsm"],
+                        help="Input composite. rgb/cir/ndvi_h_nir/rgb_ndvi need only RGB+NIR and "
+                             "transfer to the EU UAV target; ndvi_dsm_h/rgb_dsm need FLAIR's nDSM "
+                             "and are a diagnostic upper bound only.")
+    parser.add_argument("--shannon_source", type=str, default="ndvi", choices=["ndvi", "elevation"],
+                        help="Raster the local Shannon entropy is computed over. Default 'ndvi' "
+                             "because 'elevation' does not transfer to RGB+NIR target data.")
     parser.add_argument("--k_shot", type=int, default=1, choices=[1, 5], help="Number of support shots")
     parser.add_argument("--strategy", type=str, default="ecological", choices=list(STRATEGIES), help="Prompt selection strategy")
     parser.add_argument("--holdout_domains", type=str, nargs="*", default=None, help="Optional domain IDs to hold out for evaluation")
@@ -377,6 +382,10 @@ def main():
     parser.add_argument("--model_backend", type=str, default="auto", choices=["auto", "native", "hf", "sam2", "sam", "sam1", "segment_anything", "mock"], help="Model backend")
     parser.add_argument("--sam_checkpoint", type=str, default=None, help="Path to SAM checkpoint (e.g. sam_vit_b_01ec64.pth)")
     parser.add_argument("--sam3_checkpoint", type=str, default=None, help="Path to local SAM 3 checkpoint or HF model id")
+    parser.add_argument("--use_elevation", action="store_true", default=False,
+                        help="Let canopy height feed the ecological plausibility. FLAIR-only: the "
+                             "EU UAV target has no elevation, so this cannot transfer. Use it to "
+                             "quantify what the sensor is missing, never as the headline method.")
     parser.add_argument("--nir_insertion", type=str, default="none", choices=list(INSERTIONS),
                         help="Where spectral evidence enters. 'none' = RGB pipeline unchanged; "
                              "'modulate'/'prompt' blend ecological plausibility into the similarity "
@@ -511,17 +520,21 @@ def main():
             # predecessor's headline figure meaningless.
             plausibility = None
             if args.nir_insertion in ("modulate", "prompt") and args.nir_weight > 0.0:
+                # Elevation is withheld unless explicitly requested: the EU UAV target
+                # sensor does not have it, so a result that depends on it cannot ship.
+                s_elev = s_sample["elevation"].squeeze(0).numpy() if args.use_elevation else None
+                q_elev = q_sample["elevation"].squeeze(0).numpy() if args.use_elevation else None
                 ref = reference_stats(
                     s_mask_c,
                     ndvi=s_sample["ndvi"].squeeze(0).numpy(),
                     shannon=s_sample["shannon"].squeeze(0).numpy(),
-                    elevation=s_sample["elevation"].squeeze(0).numpy(),
+                    elevation=s_elev,
                 )
                 plausibility = ecological_plausibility(
                     ref,
                     ndvi=q_sample["ndvi"].squeeze(0).numpy(),
                     shannon=q_sample["shannon"].squeeze(0).numpy(),
-                    elevation=q_sample["elevation"].squeeze(0).numpy(),
+                    elevation=q_elev,
                 )
 
             pred_query_bin = model.predict(
@@ -586,6 +599,8 @@ def main():
         "model_id": getattr(model, "model_id", None),
         "composite": args.composite,
         "nir_insertion": args.nir_insertion,
+        "uses_elevation": bool(args.use_elevation or dataset.uses_elevation),
+        "transfers_to_rgb_nir": not bool(args.use_elevation or dataset.uses_elevation),
         "nir_weight": args.nir_weight,
         "shannon_source": args.shannon_source,
         "k_shot": args.k_shot,

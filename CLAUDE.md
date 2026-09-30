@@ -29,6 +29,26 @@ training-free SAM 3, the composite is the *only* moving part — no learning rat
 count, nothing else to confound it. Preserve that property. If you find yourself adding a
 trainable component, stop and reconsider: it costs the project its cleanest measurement.
 
+## The elevation constraint — read before touching composites
+
+**The EU UAV target data carries RGB + NIR and NO elevation.** FLAIR has a per-pixel nDSM;
+the deliverable sensor does not. Anything whose result depends on canopy height cannot ship.
+
+- Main experimental path uses `FLAIRDataset.ELEVATION_FREE` only:
+  `rgb`, `cir`, `ndvi_h_nir`, `rgb_ndvi`.
+- `ndvi_dsm_h` and `rgb_dsm` (`ELEVATION_DEPENDENT`) and `shannon_source="elevation"` and
+  `--use_elevation` are retained **solely as a FLAIR-only diagnostic** — they answer "how
+  much would canopy height buy if the payload had it?", which is a reportable question
+  about what the EU UAV sensor is missing. Never a headline method.
+- Selecting any of them prints a warning; results record `uses_elevation` and
+  `transfers_to_rgb_nir`, and `run.sh` marks non-transferable rows in its summary.
+- `test_elevation_free_composites_ignore_the_dsm` asserts this mechanically: perturb the
+  nDSM and every elevation-free composite must be bit-identical.
+
+This reverses an earlier recommendation. `shannon_source="elevation"` is a better
+structural measure and survives leaf-off, but it does not transfer, so the default is
+entropy over NDVI.
+
 ## FLAIR facts that are easy to get wrong
 
 - **Channel order is B, G, R, NIR, Elevation.** BGR-first, and NIR is index **3**, not 4.
@@ -65,10 +85,9 @@ deficit as diversity — a ring of fabricated heterogeneity ~0.13 wide on a *uni
 scaling with window size. `padding_mode="zeros"` remains only for reproducing the
 predecessor's numbers.
 
-`shannon_source="elevation"` computes entropy over canopy height rather than NDVI. That is
-closer to the landscape-metric meaning of Shannon diversity and survives leaf-off
-acquisition, since bare branches still have height variance. Worth preferring, and worth
-ablating against `"ndvi"`.
+`shannon_source` defaults to `"ndvi"`. `"elevation"` computes entropy over canopy height,
+which is closer to the landscape-metric meaning and survives leaf-off — but it needs the
+nDSM, so it is a FLAIR-only diagnostic (see the elevation constraint above).
 
 Window size is in pixels at 0.20 m GSD — a 7 px window spans 1.4 m. Sweep it; the
 predecessor never did, and its Shannon channel failed to separate any classes.

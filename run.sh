@@ -16,6 +16,12 @@
 #
 # The two axes:
 #   BACKENDS   sam (ViT-B) | sam2 (Hiera-S) | native/hf (SAM 3)
+#
+# ELEVATION IS OFF THE TABLE. The EU UAV target data is RGB + NIR with no DSM,
+# so FLAIR's nDSM channel cannot be on the deliverable path. Composites and
+# Shannon sources are elevation-free by default; ndvi_dsm_h / rgb_dsm /
+# --use_elevation remain only as a FLAIR-only diagnostic of what the payload
+# is missing. Set DIAGNOSTIC=1 to append that arm.
 #   INSERTION  where NIR acts:
 #                --composite cir          input substitution   (MEASURED: harmful)
 #                --nir_insertion modulate post-encoder blend    (untested)
@@ -112,8 +118,10 @@ run_eval () {   # backend composite insertion weight strategy
 for B in $BACKENDS; do
     echo; echo "############ ENCODER: $B ############"
 
-    # (a) Input-substitution axis. Reproduces the measured Phase 3 comparison.
-    for COMP in rgb cir ndvi_dsm_h; do
+    # (a) Input-substitution axis. ELEVATION-FREE composites only -- the EU UAV
+    #     target carries RGB + NIR and no nDSM, so a result depending on canopy
+    #     height cannot ship. ndvi_h_nir replaces the old ndvi_dsm_h here.
+    for COMP in rgb cir ndvi_h_nir rgb_ndvi; do
         run_eval "$B" "$COMP" none 0.0 ecological
     done
 
@@ -132,6 +140,13 @@ for B in $BACKENDS; do
     done
 done
 
+    # (d) OPTIONAL elevation diagnostic. Not a deliverable result -- it answers
+    #     "how much would canopy height buy us if the EU UAV payload had it?"
+    if [ "${DIAGNOSTIC:-0}" = "1" ]; then
+        echo; echo "--- elevation diagnostic (FLAIR-only, does not transfer) ---"
+        run_eval "$B" ndvi_dsm_h none 0.0 ecological
+    fi
+
 # ---------------------------------------------------------------------------
 # 5. Summary
 # ---------------------------------------------------------------------------
@@ -141,12 +156,13 @@ import json, glob
 rows = [json.load(open(f)) for f in sorted(glob.glob('./outputs/results_*.json'))]
 if not rows:
     print('No results.'); raise SystemExit
-print(f\"{'backend':<9}{'composite':<12}{'insert':<10}{'w':>5}{'strategy':<12}{'mIoU':>8}{'FB-IoU':>9}\")
-print('-' * 66)
+print(f\"{'backend':<9}{'composite':<12}{'insert':<10}{'w':>5}{'strategy':<11}{'mIoU':>8}{'FB-IoU':>9}  transfers\")
+print('-' * 78)
 for r in sorted(rows, key=lambda r: -r.get('miou', 0)):
+    t = '' if r.get('transfers_to_rgb_nir', True) else '  NO (elevation)'
     print(f\"{r.get('backend','?'):<9}{r.get('composite','?'):<12}\"
           f\"{r.get('nir_insertion','?'):<10}{r.get('nir_weight',0):>5}\"
-          f\"{r.get('strategy','?'):<12}{r.get('miou',0):>8.4f}{r.get('fb_iou',0):>9.4f}\")
+          f\"{r.get('strategy','?'):<11}{r.get('miou',0):>8.4f}{r.get('fb_iou',0):>9.4f}{t}\")
 "
 
 echo; echo "Job completed at $(date)"

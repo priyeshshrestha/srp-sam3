@@ -67,8 +67,25 @@ def install_fake_reader(elevation_metres=True):
     return {"blue": blue, "green": green, "red": red, "nir": nir, "elev": elev}
 
 
+def _reader_with_elevation(elev_m):
+    """A fake reader identical to install_fake_reader's except for canopy height."""
+    blue, green, red, nir = 40.0, 90.0, 60.0, 200.0
+
+    def fake_read(path):
+        if "MSK" in os.path.basename(path):
+            mask = np.full((1, SIZE, SIZE), 7, dtype=np.uint8)
+            mask[:, : SIZE // 2, :] = 1
+            return mask
+        patch = np.zeros((5, SIZE, SIZE), dtype=np.float32)
+        patch[BLUE], patch[GREEN], patch[RED], patch[NIR] = blue, green, red, nir
+        patch[ELEV] = elev_m
+        return patch
+
+    return fake_read
+
+
 def test_discovery_and_pairing():
-    print("[1/6] Discovery, IMG/MSK pairing and domain parsing...")
+    print("[1/7] Discovery, IMG/MSK pairing and domain parsing...")
     root = tempfile.mkdtemp()
     try:
         made = build_fake_tree(root)
@@ -88,7 +105,7 @@ def test_discovery_and_pairing():
 
 
 def test_ndvi_arithmetic():
-    print("[2/6] NDVI is computed from the right two bands...")
+    print("[2/7] NDVI is computed from the right two bands...")
     root = tempfile.mkdtemp()
     try:
         build_fake_tree(root)
@@ -111,7 +128,7 @@ def test_ndvi_arithmetic():
 
 
 def test_composites():
-    print("[3/6] Every composite is (3, H, W) float32 in [0, 1]...")
+    print("[3/7] Every composite is (3, H, W) float32 in [0, 1]...")
     root = tempfile.mkdtemp()
     try:
         build_fake_tree(root)
@@ -138,8 +155,54 @@ def test_composites():
         shutil.rmtree(root)
 
 
+def test_elevation_free_composites_ignore_the_dsm():
+    """The EU UAV target carries RGB + NIR and no elevation.
+
+    Anything on the deliverable path must therefore be computable without the nDSM. This
+    asserts it mechanically rather than by inspection: change the elevation channel wildly
+    and every ELEVATION_FREE composite must be bit-identical, while every
+    ELEVATION_DEPENDENT one must change. A composite that quietly picked up the DSM would
+    produce a headline number that cannot transfer.
+    """
+    print("[4/7] Elevation-free composites are unaffected by the nDSM...")
+    root = tempfile.mkdtemp()
+    try:
+        build_fake_tree(root)
+
+        install_fake_reader(elevation_metres=True)          # nDSM = 12 m
+        low = {name: FLAIRDataset(root=root, composite=name)[0]["image"].clone()
+               for name in FLAIRDataset.COMPOSITES}
+
+        # Same scene, radically different canopy height.
+        flair_mod._read_tif = _reader_with_elevation(28.0)
+        high = {name: FLAIRDataset(root=root, composite=name)[0]["image"]
+                for name in FLAIRDataset.COMPOSITES}
+
+        for name in FLAIRDataset.ELEVATION_FREE:
+            assert torch.allclose(low[name], high[name]), \
+                f"composite {name!r} is listed as elevation-free but changed with the nDSM"
+        for name in FLAIRDataset.ELEVATION_DEPENDENT:
+            assert not torch.allclose(low[name], high[name]), \
+                f"composite {name!r} is listed as elevation-dependent but ignored the nDSM"
+
+        # Every composite must be accounted for in exactly one of the two lists.
+        assert set(FLAIRDataset.ELEVATION_FREE) | set(FLAIRDataset.ELEVATION_DEPENDENT) \
+            == set(FLAIRDataset.COMPOSITES)
+        assert not set(FLAIRDataset.ELEVATION_FREE) & set(FLAIRDataset.ELEVATION_DEPENDENT)
+
+        # Shannon over NDVI must likewise be independent of height.
+        install_fake_reader(elevation_metres=True)
+        h_low = FLAIRDataset(root=root, shannon_source="ndvi")[0]["shannon"].clone()
+        flair_mod._read_tif = _reader_with_elevation(28.0)
+        h_high = FLAIRDataset(root=root, shannon_source="ndvi")[0]["shannon"]
+        assert torch.allclose(h_low, h_high), "shannon_source='ndvi' leaked elevation"
+        print("      --> Passed!")
+    finally:
+        shutil.rmtree(root)
+
+
 def test_elevation_scaling():
-    print("[4/6] Elevation is clipped and normalised, not treated as a DN...")
+    print("[5/7] Elevation is clipped and normalised, not treated as a DN...")
     root = tempfile.mkdtemp()
     try:
         build_fake_tree(root)
@@ -162,7 +225,7 @@ def test_elevation_scaling():
 
 
 def test_shannon_source():
-    print("[5/6] Shannon can be computed over NDVI or over height...")
+    print("[6/7] Shannon can be computed over NDVI or over height...")
     root = tempfile.mkdtemp()
     try:
         build_fake_tree(root)
@@ -187,7 +250,7 @@ def test_shannon_source():
 
 
 def test_splits_and_nomenclature():
-    print("[6/6] Domain splits and the class nomenclature...")
+    print("[7/7] Domain splits and the class nomenclature...")
     root = tempfile.mkdtemp()
     try:
         build_fake_tree(root)
@@ -219,6 +282,7 @@ if __name__ == "__main__":
     test_discovery_and_pairing()
     test_ndvi_arithmetic()
     test_composites()
+    test_elevation_free_composites_ignore_the_dsm()
     test_elevation_scaling()
     test_shannon_source()
     test_splits_and_nomenclature()

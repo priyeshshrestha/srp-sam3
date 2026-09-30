@@ -146,20 +146,45 @@ class FLAIRDataset(Dataset):
     question this project exists to answer. Every option below is the same underlying
     patch rendered differently -- nothing else in the pipeline changes.
 
+    TRANSFERABLE (RGB + NIR only -- these are the ones that matter):
+
       'rgb'        true colour. The control.
       'cir'        colour-infrared: NIR, Red, Green. The standard remote-sensing false
                    colour; vegetation renders bright red. Violates the pretraining colour
                    statistics, which is exactly what makes it worth measuring.
-      'ndvi_dsm_h' fully derived: NDVI, normalised nDSM, local Shannon entropy. Discards
-                   raw radiometry entirely in favour of ecological quantities.
       'rgb_ndvi'   Red, Green, NDVI -- keeps two true bands, swaps blue for vegetation index.
-      'rgb_dsm'    Red, Green, normalised height. Tests structure alone against colour.
+      'ndvi_h_nir' fully derived, no elevation: NDVI, local Shannon entropy, NIR. Discards
+                   visible radiometry entirely in favour of ecological quantities.
+
+    FLAIR-ONLY (require the nDSM, which the EU UAV target data does not have):
+
+      'ndvi_dsm_h' NDVI, normalised nDSM, local Shannon entropy.
+      'rgb_dsm'    Red, Green, normalised height. Structure alone against colour.
+
+    THE ELEVATION CONSTRAINT. The project's final target is the EU UAV campaigns, which
+    carry RGB + NIR and NO elevation. Anything built on FLAIR's nDSM therefore cannot
+    ship. The two FLAIR-only composites are retained deliberately, but only as a
+    DIAGNOSTIC UPPER BOUND -- they answer "how much would canopy height buy us if the
+    sensor had it?", which is a real and reportable question about what the EU UAV
+    payload is missing. They must never be the headline method. `ELEVATION_FREE` lists
+    what actually transfers; prefer it for anything on the main experimental path.
+
+    The same constraint applies to `shannon_source`: entropy over the nDSM is a better
+    structural measure and survives leaf-off, but it does not transfer, so the default
+    is entropy over NDVI.
 
     All composites are returned as float32 in [0, 1] so they can be fed to any model
     expecting ordinary image input without further rescaling.
     """
 
-    COMPOSITES = ("rgb", "cir", "ndvi_dsm_h", "rgb_ndvi", "rgb_dsm")
+    COMPOSITES = ("rgb", "cir", "ndvi_h_nir", "rgb_ndvi", "ndvi_dsm_h", "rgb_dsm")
+
+    # Composites computable from RGB + NIR alone, i.e. the ones that survive the move to
+    # the EU UAV target data. Everything on the main experimental path should come from here.
+    ELEVATION_FREE = ("rgb", "cir", "ndvi_h_nir", "rgb_ndvi")
+
+    # Composites requiring the nDSM. FLAIR-only; diagnostic upper bound, not deliverable.
+    ELEVATION_DEPENDENT = ("ndvi_dsm_h", "rgb_dsm")
 
     def __init__(
         self,
@@ -190,6 +215,24 @@ class FLAIRDataset(Dataset):
         """
         if composite not in self.COMPOSITES:
             raise ValueError(f"composite must be one of {self.COMPOSITES}, got {composite!r}")
+
+        # The EU UAV target data carries RGB + NIR and no elevation, so anything using the
+        # nDSM is a FLAIR-only diagnostic. Say so loudly rather than letting a headline
+        # number quietly depend on a channel the deliverable sensor does not have.
+        uses_elevation = (composite in self.ELEVATION_DEPENDENT) or (shannon_source == "elevation")
+        if uses_elevation:
+            reasons = []
+            if composite in self.ELEVATION_DEPENDENT:
+                reasons.append(f"composite={composite!r}")
+            if shannon_source == "elevation":
+                reasons.append("shannon_source='elevation'")
+            print(
+                f"WARNING: {' and '.join(reasons)} {'depend' if len(reasons) > 1 else 'depends'} on the nDSM. The EU UAV target data "
+                f"is RGB + NIR only, so this configuration CANNOT TRANSFER and is a FLAIR-only "
+                f"diagnostic. Elevation-free options: composites {self.ELEVATION_FREE}, "
+                f"shannon_source='ndvi'."
+            )
+        self.uses_elevation = uses_elevation
         if shannon_source not in ("ndvi", "elevation"):
             raise ValueError(f"shannon_source must be 'ndvi' or 'elevation', got {shannon_source!r}")
 
@@ -286,6 +329,10 @@ class FLAIRDataset(Dataset):
             return np.stack([red, green, blue])
         if self.composite == "cir":
             return np.stack([nir, red, green])
+        if self.composite == "ndvi_h_nir":
+            # Elevation-free counterpart of 'ndvi_dsm_h': raw NIR takes the slot the nDSM
+            # would occupy, so the composite transfers to an RGB+NIR sensor unchanged.
+            return np.stack([ndvi01, shannon, nir])
         if self.composite == "ndvi_dsm_h":
             return np.stack([ndvi01, elev_norm, shannon])
         if self.composite == "rgb_ndvi":

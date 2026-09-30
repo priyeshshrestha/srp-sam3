@@ -29,9 +29,16 @@ Candidate composites, all implemented in [`datasets/flair.py`](datasets/flair.py
 |---|---|---|
 | `rgb` | Red, Green, Blue | Control. What the model was pretrained on. |
 | `cir` | NIR, Red, Green | Standard remote-sensing false colour; vegetation renders bright red. Violates pretraining colour statistics, which is precisely what makes it worth measuring. |
-| `ndvi_dsm_h` | NDVI, height, Shannon *H* | Discards raw radiometry entirely for ecological quantities. |
+| `ndvi_h_nir` | NDVI, Shannon *H*, NIR | Discards visible radiometry entirely for ecological quantities. |
 | `rgb_ndvi` | Red, Green, NDVI | Keeps two true bands, swaps blue for a vegetation index. |
-| `rgb_dsm` | Red, Green, height | Structure against colour, no spectral vegetation signal. |
+| `ndvi_dsm_h` † | NDVI, height, Shannon *H* | **FLAIR-only.** Needs the nDSM. |
+| `rgb_dsm` † | Red, Green, height | **FLAIR-only.** Structure against colour. |
+
+† **The EU UAV target data is RGB + NIR with no elevation.** The two marked composites, plus
+`shannon_source="elevation"` and `--use_elevation`, cannot transfer to the deliverable sensor.
+They are retained as a diagnostic upper bound — *how much would canopy height buy us if the
+payload had it?* — never as the headline method. Selecting one prints a warning, and every
+result records `transfers_to_rgb_nir`.
 
 ---
 
