@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=srp_sam3_flair
+#SBATCH --job-name=srp_sam_flair
 #SBATCH --output=logs/%x_%j.log
 #SBATCH --error=logs/%x_%j.err
 #SBATCH --mail-user=shresthap@uni-hildesheim.de
@@ -11,133 +11,142 @@
 #SBATCH --time=12:00:00
 
 # ---------------------------------------------------------------------------
-# University cluster job. Submit with:  sbatch run.sh
+# No training happens here. Every model is frozen. The experiment varies only
+# WHICH ENCODER is used and WHERE spectral evidence enters the pipeline.
 #
-# There is NO TRAINING in this pipeline. SAM 3 few-shot segmentation is
-# training-free -- the model stays frozen and the only thing that varies is
-# which three channels are fed to it. So this job prepares the data and then
-# runs an evaluation sweep. It is GPU-bound only in stage 5.
+# The two axes:
+#   BACKENDS   sam (ViT-B) | sam2 (Hiera-S) | native/hf (SAM 3)
+#   INSERTION  where NIR acts:
+#                --composite cir          input substitution   (MEASURED: harmful)
+#                --nir_insertion modulate post-encoder blend    (untested)
+#                --nir_insertion prompt   prompt-point choice   (untested)
 #
-# Stages 1-4 need no GPU at all. If the queue for GPU nodes is long, run those
-# on a CPU partition first; stage 4 in particular is the slow one.
+# Measured baseline, SAM 1 + prototype-cosine prompting, 1-shot FLAIR:
+#   rgb 0.2860 | cir 0.2535 | ndvi_dsm_h 0.2442
+#   Vegetation classes are TIED (0.348/0.347/0.337); RGB wins entirely on
+#   albedo-defined classes (impervious 0.340->0.124, plowed 0.374->0.229).
+#   Hence: keep RGB at the input, insert spectra after the encoder.
+#
+# If SLURM is absent (this box has no `module` command and may be a plain
+# node), run directly:  CUDA_VISIBLE_DEVICES=0 bash run.sh
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
-echo "Job $SLURM_JOB_ID on $(hostname) at $(date)"
+echo "Job ${SLURM_JOB_ID:-local} on $(hostname) at $(date)"
 echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-unset}"
 
 export PYTHONPATH="${PYTHONPATH:-}:$(pwd)"
 mkdir -p logs outputs
 
-# Adjust to match your cluster's module system / environment name.
-# module load cuda/12.1
-source activate srp_env
+# source activate srp_env     # uncomment/adjust for your environment
 
 FLAIR_DATA_DIR="${FLAIR_DATA_DIR:-./data}"
 CLASS_INDEX="${CLASS_INDEX:-./outputs/flair_class_index.json}"
-COMPOSITES="${COMPOSITES:-rgb cir ndvi_dsm_h rgb_ndvi rgb_dsm}"
-SHANNON_SOURCE="${SHANNON_SOURCE:-elevation}"
-K_SHOT="${K_SHOT:-5}"
+K_SHOT="${K_SHOT:-1}"
+EPISODES="${EPISODES:-30}"
 HOLDOUT_DOMAINS="${HOLDOUT_DOMAINS:-}"
+
+# Which encoders to compare. Drop any that will not load on this machine.
+BACKENDS="${BACKENDS:-sam sam2}"
 
 # ---------------------------------------------------------------------------
 # 1. Data present?
 # ---------------------------------------------------------------------------
-# Compute nodes frequently have no outbound network, so the download is NOT done
-# here. Fetch it on a login node first:  bash scripts/download_toy.sh ./data
 if [ ! -d "$FLAIR_DATA_DIR" ] || [ -z "$(find "$FLAIR_DATA_DIR" -name 'IMG_*.tif' -print -quit 2>/dev/null)" ]; then
-    echo "ERROR: no FLAIR patches found under $FLAIR_DATA_DIR"
-    echo "Fetch them on a login node first:"
-    echo "    bash scripts/download_toy.sh $FLAIR_DATA_DIR       # ~750 MB toy subset"
-    echo "    # or download FLAIR #1 from https://ignf.github.io/FLAIR/"
-    echo "Then resubmit, or set FLAIR_DATA_DIR to an existing copy."
+    echo "ERROR: no FLAIR patches under $FLAIR_DATA_DIR"
+    echo "Fetch on a login node first:  bash scripts/download_toy.sh $FLAIR_DATA_DIR"
     exit 1
 fi
-echo "Found $(find "$FLAIR_DATA_DIR" -name 'IMG_*.tif' | wc -l | tr -d ' ') FLAIR patches in $FLAIR_DATA_DIR"
+echo "Found $(find "$FLAIR_DATA_DIR" -name 'IMG_*.tif' | wc -l | tr -d ' ') FLAIR patches"
 
 # ---------------------------------------------------------------------------
-# 2. Loader logic tests (fast, no data, no GPU)
+# 2. Tests, then verify the band-order assumption against the real files
 # ---------------------------------------------------------------------------
-echo
-echo "=== Stage 2: loader tests ==="
-srun --ntasks=1 python tests/test_flair.py
+echo; echo "=== Stage 2: tests (no GPU, no data) ==="
+python tests/test_flair.py
+python tests/test_canvas_prompting.py
+python tests/test_spectral.py
+
+echo; echo "=== Stage 3: band order + per-class NDVI ==="
+# READ THIS OUTPUT. If the channel-order check FAILs, stop -- every NDVI
+# downstream is meaningless until it is resolved.
+python scripts/inspect_flair.py --root "$FLAIR_DATA_DIR" --samples 50
 
 # ---------------------------------------------------------------------------
-# 3. Verify the band-order assumption against the actual download
+# 3. Class index (one full pass over every mask; cached)
 # ---------------------------------------------------------------------------
-# This is not ceremony. The loader hard-codes B,G,R,NIR,Elevation from the FLAIR
-# spec rather than reading it from the files, and that assumption determines every
-# NDVI value the project produces. The script checks it with physics: on a
-# vegetated scene the true NIR band must be the brightest.
-#
-# READ THE OUTPUT. If it prints a FAIL on the channel-order check, stop -- every
-# downstream number is meaningless until it is resolved.
-echo
-echo "=== Stage 3: verify band order and per-class NDVI ==="
-srun --ntasks=1 python scripts/inspect_flair.py --root "$FLAIR_DATA_DIR" --samples 50
-
-# ---------------------------------------------------------------------------
-# 4. Build the class index (slow: one full pass over every mask)
-# ---------------------------------------------------------------------------
-# Episodic sampling needs to know which patches contain which of the 19 classes.
-# Done once and cached; skipped if the JSON already exists.
-echo
-echo "=== Stage 4: class index ==="
+echo; echo "=== Stage 4: class index ==="
 if [ -f "$CLASS_INDEX" ]; then
-    echo "Class index already at $CLASS_INDEX -- skipping."
+    echo "Already at $CLASS_INDEX -- skipping."
 else
-    srun --ntasks=1 python -c "
+    python -c "
 import sys; sys.path.insert(0, '.')
 from datasets.flair import FLAIRDataset
 ds = FLAIRDataset(root='$FLAIR_DATA_DIR')
-print(f'Indexing {len(ds)} patches across 19 classes...', flush=True)
+print(f'Indexing {len(ds)} patches...', flush=True)
 idx = ds.build_class_index(save_to='$CLASS_INDEX')
-for c, patches in sorted(idx.items()):
-    print(f'  class {c:2d}: {len(patches):6d} patches')
+for c, p in sorted(idx.items()): print(f'  class {c:2d}: {len(p):6d} patches')
 "
 fi
 
 # ---------------------------------------------------------------------------
-# 5. Few-shot evaluation sweep (GPU)
+# 4. The sweep
 # ---------------------------------------------------------------------------
-# The experiment: hold the model frozen, vary only which three channels it sees.
-echo
-echo "=== Stage 5: composite sweep, ${K_SHOT}-shot ==="
-if [ ! -f scripts/evaluate_sam3.py ]; then
-    echo "SKIPPED: scripts/evaluate_sam3.py does not exist yet."
-    echo "The SAM 3 wrapper is not written. Stages 1-4 have done the expensive"
-    echo "preparation, so once the wrapper lands this job resumes cheaply."
-    echo
-    echo "Job finished (data prepared) at $(date)"
-    exit 0
-fi
-
-for COMPOSITE in $COMPOSITES; do
-    echo
-    echo "--- composite: $COMPOSITE ---"
-    srun --ntasks=1 python scripts/evaluate_sam3.py \
+run_eval () {   # backend composite insertion weight strategy
+    echo; echo "--- backend=$1 composite=$2 insertion=$3 weight=$4 strategy=$5 ---"
+    python scripts/evaluate_sam3.py \
         --root "$FLAIR_DATA_DIR" \
         --class_index "$CLASS_INDEX" \
-        --composite "$COMPOSITE" \
-        --shannon_source "$SHANNON_SOURCE" \
+        --model_backend "$1" \
+        --composite "$2" \
+        --nir_insertion "$3" \
+        --nir_weight "$4" \
+        --strategy "$5" \
         --k_shot "$K_SHOT" \
+        --num_episodes "$EPISODES" \
         ${HOLDOUT_DOMAINS:+--holdout_domains $HOLDOUT_DOMAINS} \
-        --output_dir ./outputs
+        --output_dir ./outputs \
+    || echo "  FAILED (backend unavailable?) -- continuing"
+}
+
+for B in $BACKENDS; do
+    echo; echo "############ ENCODER: $B ############"
+
+    # (a) Input-substitution axis. Reproduces the measured Phase 3 comparison.
+    for COMP in rgb cir ndvi_dsm_h; do
+        run_eval "$B" "$COMP" none 0.0 ecological
+    done
+
+    # (b) Post-encoder insertion, on RGB input. weight=0.0 must reproduce the
+    #     rgb/none row exactly -- that identity is the sanity check on the whole
+    #     arm, so run it before trusting any non-zero weight.
+    run_eval "$B" rgb modulate 0.0 ecological
+    for W in 0.2 0.4 0.6; do
+        run_eval "$B" rgb modulate "$W" ecological
+    done
+
+    # (c) Prompt-selection ablation. Is the ecological box choice doing anything?
+    #     Never measured -- all Phase 3 runs used 'ecological' with no control.
+    for S in random largest compact; do
+        run_eval "$B" rgb none 0.0 "$S"
+    done
 done
 
-echo
-echo "=== Summary ==="
-srun --ntasks=1 python -c "
-import json, glob, os
-rows = []
-for f in sorted(glob.glob('./outputs/results_*.json')):
-    with open(f) as fh: rows.append(json.load(fh))
+# ---------------------------------------------------------------------------
+# 5. Summary
+# ---------------------------------------------------------------------------
+echo; echo "=== Summary ==="
+python -c "
+import json, glob
+rows = [json.load(open(f)) for f in sorted(glob.glob('./outputs/results_*.json'))]
 if not rows:
-    print('No results written.'); raise SystemExit
-print(f\"{'composite':<14}{'k':>3}{'mIoU':>9}{'std':>8}\")
+    print('No results.'); raise SystemExit
+print(f\"{'backend':<9}{'composite':<12}{'insert':<10}{'w':>5}{'strategy':<12}{'mIoU':>8}{'FB-IoU':>9}\")
+print('-' * 66)
 for r in sorted(rows, key=lambda r: -r.get('miou', 0)):
-    print(f\"{r.get('composite','?'):<14}{r.get('k_shot','?'):>3}{r.get('miou',0):>9.4f}{r.get('std',0):>8.4f}\")
+    print(f\"{r.get('backend','?'):<9}{r.get('composite','?'):<12}\"
+          f\"{r.get('nir_insertion','?'):<10}{r.get('nir_weight',0):>5}\"
+          f\"{r.get('strategy','?'):<12}{r.get('miou',0):>8.4f}{r.get('fb_iou',0):>9.4f}\")
 "
 
-echo
-echo "Job completed at $(date)"
+echo; echo "Job completed at $(date)"
