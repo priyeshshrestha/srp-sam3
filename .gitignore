@@ -12,7 +12,10 @@ checkpoints/
 *.pt
 *.zip
 
-# Run artefacts
-outputs/
+# Run artefacts. Result JSONs are small and are the experimental record -- keep them.
+outputs/*
+!outputs/phase3/
+outputs/phase3/*
+!outputs/phase3/*.json
 logs/
 *.log

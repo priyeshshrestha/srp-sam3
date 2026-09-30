@@ -1,0 +1,23 @@
+{
+  "composite": "ndvi_dsm_h",
+  "shannon_source": "elevation",
+  "k_shot": 1,
+  "strategy": "ecological",
+  "miou": 0.2442,
+  "std": 0.1232,
+  "fb_iou": 0.2748,
+  "class_ious": {
+    "building": 0.1040,
+    "pervious_surface": 0.0820,
+    "impervious_surface": 0.1556,
+    "bare_soil": 0.1575,
+    "water": 0.2618,
+    "coniferous": 0.3663,
+    "deciduous": 0.3493,
+    "brushwood": 0.1689,
+    "vineyard": 0.5413,
+    "herbaceous_vegetation": 0.2606,
+    "agricultural_land": 0.2550,
+    "plowed_land": 0.2286
+  }
+}

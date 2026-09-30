@@ -1,0 +1,23 @@
+{
+  "composite": "rgb",
+  "shannon_source": "elevation",
+  "k_shot": 1,
+  "strategy": "ecological",
+  "miou": 0.2860,
+  "std": 0.1357,
+  "fb_iou": 0.2935,
+  "class_ious": {
+    "building": 0.1036,
+    "pervious_surface": 0.1061,
+    "impervious_surface": 0.3402,
+    "bare_soil": 0.2097,
+    "water": 0.3037,
+    "coniferous": 0.4489,
+    "deciduous": 0.3454,
+    "brushwood": 0.1247,
+    "vineyard": 0.5695,
+    "herbaceous_vegetation": 0.2536,
+    "agricultural_land": 0.2525,
+    "plowed_land": 0.3738
+  }
+}
