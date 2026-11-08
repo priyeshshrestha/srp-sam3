@@ -28,4 +28,4 @@ unzip -q -o "$ARCHIVE" -d "$DEST"
 
 echo
 echo "Done. Now verify the loader's assumptions against the real files:"
-echo "    python scripts/inspect_flair.py --root $DEST"
+echo "    bash run.sh check   # then bash run.sh"

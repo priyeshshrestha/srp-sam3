@@ -108,6 +108,12 @@ def _read_tif(path: str) -> np.ndarray:
 
 def mask_path_for(img_path: str) -> Optional[str]:
     """Derive the MSK path for an IMG path by substituting in both dir and filename."""
+    # FLAIR-HUB: <dom>_AERIAL_RGBI/<roi>/<dom>_AERIAL_RGBI_<roi>_<x-y>.tif
+    #        ->   <dom>_AERIAL_LABEL-COSIA/<roi>/<dom>_AERIAL_LABEL-COSIA_<roi>_<x-y>.tif
+    if "_AERIAL_RGBI" in img_path:
+        candidate = img_path.replace("_AERIAL_RGBI", "_AERIAL_LABEL-COSIA")
+        return candidate if os.path.exists(candidate) else None
+
     directory, filename = os.path.split(img_path)
     msk_name = filename.replace("IMG", "MSK", 1)
     candidates = [
@@ -131,9 +137,10 @@ def domain_of(path: str) -> str:
     acquisition date, so holding out whole domains tests both geographic and seasonal
     transfer. Falls back to the grandparent directory name when the pattern is absent.
     """
-    match = re.search(r"(D\d{3}_\d{4})", path)
+    # FLAIR #1 writes domains as D041_2021, FLAIR-HUB as D041-2021; report the #1 spelling.
+    match = re.search(r"(D\d{3,6})[_-](\d{4})", path)   # D054057-2018 merges two departments
     if match:
-        return match.group(1)
+        return f"{match.group(1)}_{match.group(2)}"
     parts = os.path.normpath(path).split(os.sep)
     return parts[-4] if len(parts) >= 4 else "unknown"
 

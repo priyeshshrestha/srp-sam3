@@ -19,3 +19,10 @@ outputs/phase3/*
 !outputs/phase3/*.json
 logs/
 *.log
+
+# Generated deck, figures and Keynote exports (rebuild with presentation/build_deck.py)
+presentation/out/
+
+# Course documents, private notes and personal data stay local (the repository is public)
+SRP_documents/
+*.local.txt

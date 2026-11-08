@@ -5,6 +5,11 @@ scipy>=1.9.0
 pillow>=9.0.0
 rasterio>=1.3.0
 tifffile>=2023.1.0
+imagecodecs                      # tifffile needs it for the LZW-compressed FLAIR-HUB TIFFs
 tqdm>=4.64.0
 matplotlib>=3.6.0
-# SAM 3 is installed from source; see README.
+
+# Models (install the ones you run; each is frozen, nothing is trained)
+segment-anything                 # SAM 1
+# SAM 2.1:  pip install git+https://github.com/facebookresearch/sam2.git   (weights: sam2.1_hiera_*.pt)
+transformers                     # SAM 3 (Sam3Model/Sam3Processor): use a recent release; min version not verified. Gated weights -> `hf auth login`

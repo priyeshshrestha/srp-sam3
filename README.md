@@ -1,205 +1,121 @@
-# Ecological priors for few-shot land-cover segmentation with SAM 3
+# SAM 1 vs SAM 2 vs SAM 3 on FLAIR (few-shot), and SAM 3 trained with RGB vs RGB+NIR
 
-Few-shot semantic segmentation of vegetation and habitat classes from multispectral aerial
-imagery, using a frozen foundation model and ecological channels derived from near-infrared
-and canopy height.
+Which Segment Anything model is best at one-shot land-cover segmentation on FLAIR aerial
+imagery? Every model is frozen; nothing is trained. All three see the identical episodes
+(class, support patch, query patch), RGB only.
 
 Student Research Project 2025/26 · Group 7 · Universität Hildesheim, ISMLL.
 
-This is a clean restart. The predecessor (`ViRefSAM`, SAM v1 + ISPRS Potsdam) is preserved
-separately; see [Why a new repository](#why-a-new-repository).
-
----
-
-## The question
-
-A frozen, RGB-only foundation model has exactly **three input channels**. Multispectral
-aerial imagery offers five: blue, green, red, near-infrared, and above-ground height.
-
-**Which three should occupy those slots, and does feeding derived ecological quantities
-instead of raw colour improve few-shot segmentation of vegetation classes?**
-
-That framing matters because it makes the input composite the *only* moving part. With a
-training-free pipeline there is nothing else to confound the measurement — no learning rate,
-no episode count, no adapter initialisation. The ablation is as clean as it can be.
-
-Candidate composites, all implemented in [`datasets/flair.py`](datasets/flair.py):
-
-| Composite | Channels | Rationale |
-|---|---|---|
-| `rgb` | Red, Green, Blue | Control. What the model was pretrained on. |
-| `cir` | NIR, Red, Green | Standard remote-sensing false colour; vegetation renders bright red. Violates pretraining colour statistics, which is precisely what makes it worth measuring. |
-| `ndvi_h_nir` | NDVI, Shannon *H*, NIR | Discards visible radiometry entirely for ecological quantities. |
-| `rgb_ndvi` | Red, Green, NDVI | Keeps two true bands, swaps blue for a vegetation index. |
-| `ndvi_dsm_h` † | NDVI, height, Shannon *H* | **FLAIR-only.** Needs the nDSM. |
-| `rgb_dsm` † | Red, Green, height | **FLAIR-only.** Structure against colour. |
-
-† **The EU UAV target data is RGB + NIR with no elevation.** The two marked composites, plus
-`shannon_source="elevation"` and `--use_elevation`, cannot transfer to the deliverable sensor.
-They are retained as a diagnostic upper bound — *how much would canopy height buy us if the
-payload had it?* — never as the headline method. Selecting one prints a warning, and every
-result records `transfers_to_rgb_nir`.
-
----
-
-## Dataset: FLAIR (IGN, France)
-
-[FLAIR](https://ignf.github.io/FLAIR/) — French Land cover from Aerospace ImageRy.
-
-- **512 × 512 patches at 0.20 m** GSD, 20.4 billion annotated pixels
-- **5 channels: Blue, Green, Red, NIR, Elevation** — note the order; it is BGR-first, and
-  NIR is at index **3**, not 4 as on a 5-band MicaSense sensor
-- Channel 4 is **nDSM** (DSM − DTM): above-ground height in metres, *not* an 8-bit DN
-- **19 classes**, IDs 1–19, no class 0. Vegetation classes include coniferous, deciduous,
-  brushwood, vineyard, herbaceous vegetation, agricultural land, plowed land, clear cut
-- **55 spatial-temporal domains** across metropolitan France, varying by department *and*
-  acquisition date — so holding out domains tests geographic **and seasonal** transfer
-- Licence: **Open Licence 2.0 / etalab-2.0**. Free to use and redistribute with attribution
-  to IGN; compatible with CC-BY
-
-### Why FLAIR over ISPRS Potsdam
-
-Potsdam was flown **leaf-off**. Measured on the hold-out tiles, tree NDVI averages ≈ 0.207
-and overlaps low vegetation almost completely. An NDVI ablation there is answered by the
-dataset rather than by the method — there is no vegetation-vigour signal to find.
-
-FLAIR fixes three things at once: season becomes a *variable* rather than a fixed handicap;
-19 classes permit proper fold-based few-shot cross-validation instead of a two-class mean;
-and the classes are ecological (coniferous vs deciduous) rather than cartographic
-(tree vs low vegetation).
-
-The nDSM is a bonus worth stating plainly. The predecessor computed Shannon entropy over
-**NDVI** as an indirect proxy for canopy roughness. FLAIR supplies actual per-pixel height,
-so entropy can be computed over **structure directly** — closer to the landscape-metric
-sense of Shannon diversity, and it survives leaf-off acquisition because bare branches still
-have height variance. Set `shannon_source="elevation"`.
-
----
-
-## Quick start
+## Run it
 
 ```bash
-pip install -r requirements.txt
-
-# ~750 MB toy subset — enough to verify the loader without the full download
-bash scripts/download_toy.sh ./data
-
-# ALWAYS run this against a new download. It checks the band-order assumption
-# empirically and reports per-class NDVI and height.
-python scripts/inspect_flair.py --root ./data
-
-# Logic tests. TIFF I/O is stubbed, so these run with no data and no raster library.
-python tests/test_flair.py
+pip install -r requirements.txt        # + sam2 from GitHub, see requirements.txt
+hf auth login                          # once, for the gated SAM 3 weights (never commit a token)
+bash run.sh prefetch                   # on a node WITH internet: caches SAM 3
+bash run.sh check                      # preflight only: lists everything that is missing
+bash run.sh                            # (or: sbatch run.sh) the whole experiment
 ```
 
-`inspect_flair.py` is not optional ceremony. The loader hard-codes a band order taken from
-the FLAIR specification rather than read from the files, and that assumption is load-bearing
-for every NDVI value the project will produce. The script tests it with physics: on any
-vegetated scene the true NIR band must be markedly brighter than the visible bands, so if
-channel 3 is not the brightest, the order is wrong and nothing downstream can be trusted.
+Defaults assume `./data` (FLAIR), `./checkpoints/sam_vit_b_01ec64.pth` and
+`./checkpoints/sam2.1_hiera_small.pt`. Everything is configurable by environment variable; the
+full list is at the top of [run.sh](run.sh). Example with bigger models and explicit paths:
 
----
-
-## Usage
-
-```python
-from datasets import FLAIRDataset, split_by_domain
-
-ds = FLAIRDataset(
-    root="./data",
-    composite="cir",              # the experimental knob
-    shannon_source="elevation",   # entropy over canopy height, not NDVI
-    shannon_window=7,             # 7 px = 1.4 m at 0.20 m GSD
-)
-
-sample = ds[0]
-sample["image"]      # (3, 512, 512) float32 in [0,1] — the selected composite
-sample["rgb"]        # (3, 512, 512) always true colour, for figures
-sample["mask"]       # (512, 512) int64, class IDs 1..19
-sample["ndvi"]       # (1, 512, 512) [-1, 1]
-sample["shannon"]    # (1, 512, 512) [0, 1]
-sample["elevation"]  # (1, 512, 512) [0, 1], nDSM clipped to 30 m
-sample["domain"]     # e.g. "D004_2021"
-
-# Hold out whole domains, never random patches — neighbouring patches share
-# appearance and lighting, so a random split leaks.
-train_idx, test_idx = split_by_domain(ds, holdout=["D007_2020"])
+```bash
+FLAIR_DATA_DIR=/path/to/flair SAM1_CKPT=/p/sam_vit_b_01ec64.pth SAM2_CKPT=/p/sam2.1_hiera_small.pt \
+RUNS="sam1:vit_h:/p/sam_vit_h_4b8939.pth sam2:large:/p/sam2.1_hiera_large.pt sam3::" bash run.sh
 ```
 
-A one-off class index makes episodic sampling O(1):
+**You get** `outputs/report/summary.md` (mIoU, FB-IoU, empty-prediction rate, baselines, paired
+confidence intervals, per-class table), `outputs/report/figures/` (10 episodes, every model on the
+same episode, correct/false-positive/missed pixels coloured), `outputs/report/all_arms/summary.md`
+(every arm side by side) and `outputs/report.tar.gz`.
 
-```python
-ds.build_class_index(save_to="class_index.json")
-ds_fast = FLAIRDataset(root="./data", class_index_file="class_index.json")
+**Arms** (`ARMS="1shot 5shot oracle text"`): `1shot`/`5shot` are the few-shot task; `oracle` takes its
+prompt from the query's own ground truth (an upper bound, never a method); `text` is SAM 3 with a
+fixed class phrase. `K5_PER_CLASS=10` caps the 5x-more-expensive 5-shot arm.
+
+**NDVI read-out and the deck** (after a run):
+
+```bash
+python scripts/ndvi_indicators.py --root ./data --run outputs/runs/sam3_facebook-sam3_1shot --out outputs/ndvi/sam3_1shot.json
+python presentation/build_deck.py --root ./data          # -> presentation/out/SRP_Group7_Final.pptx
+python presentation/preview.py presentation/out/SRP_Group7_Final.pptx   # layout QA without Keynote
+bash presentation/render_keynote.sh presentation/out/SRP_Group7_Final.pptx   # .key/.pdf (macOS)
 ```
 
----
+The deck is computed entirely from `outputs/runs` and `outputs/ndvi`: models or arms that have not run
+are marked pending, never filled in.
 
-## Fixed from the predecessor
+## Training experiment: does SAM 3 improve when trained to use NIR?
 
-**Shannon entropy border artefact.** `compute_shannon_entropy_torch` convolved the one-hot
-bin stack using zero padding. Windows straddling a patch edge therefore saw phantom pixels
-belonging to no bin, the local probabilities stopped summing to 1, and the entropy formula
-read that deficit as diversity.
+SAM 3 fine-tuned on FLAIR (LoRA on the image encoder + its built-in semantic head, one text prompt per
+class), once with **RGB** and once with **RGB+NIR**, everything else identical (same seeds, images,
+augmentations, prompts, starting weights). The NIR input filters start at zero, so the RGB+NIR model
+starts as exactly pretrained SAM 3. Test regions (domains) are never seen in training.
 
-On a perfectly uniform raster the interior correctly returns ~9 × 10⁻⁶ while **every border
-pixel returns ≈ 0.13** — a ring of fabricated heterogeneity around every patch, of width
-`kernel_size // 2`. It affects ~2% of a 512 px patch at a 7 px window and ~8% at 21 px, and
-since large orthomosaics are tiled into overlapping patches, those rings land in the middle
-of real scenes at arbitrary positions.
+```bash
+tmux new -s sam3                       # it can run for days on a shared machine; survive logout
+FLAIR_DATA_DIR=/path/to/flair bash run_train.sh check     # preflight only
+FLAIR_DATA_DIR=/path/to/flair bash run_train.sh           # (or: bash run.sh train)
+bash run_train.sh status                                  # from another shell: running / waiting / done
+```
 
-Now uses `padding_mode="replicate"`, encoding the correct assumption that the landscape
-continues past the patch boundary. Pass `padding_mode="zeros"` to reproduce the old numbers.
+The GPUs are shared, so a memory probe runs first, then each run (`rgb_s0`, `rgbi_s0`, ... and
+`zeroshot_rgb`) is started on whichever GPU has enough free memory, and re-queued (resuming from its
+checkpoint) if another job takes the memory. Re-running the command resumes everything. Settings are at
+the top of [run_train.sh](run_train.sh) (`SEEDS`, `STEPS`, `GPUS`, `TEST_LIMIT`, ...).
 
-> This bug is still present in the predecessor repository and affects every Shannon map it
-> has produced.
+**You get** `outputs/train/report/summary.md` (mIoU per arm, the paired RGB+NIR − RGB difference with a
+95% CI, per-class IoU, zero-shot reference), `outputs/train/report/figures/` (10 test patches chosen by
+rule: RGB, NIR false colour, ground truth, each model) and `outputs/train_report.tar.gz`.
 
----
+## What run.sh does
 
-## Why a new repository
+1. unit tests → 2. data check → 3. **band order** (RGB or BGR, decided from your files; stops if unsure)
+→ 4. per-model preflight → 5. one fixed episode list → 6. smoke test then full run per model
+(resumable) → 7. report.
 
-The predecessor is **SAM v1 ViT-B on ISPRS Potsdam**, trained episodically: masked average
-pooling → prototype → MLP → four synthetic tokens → frozen SAM mask decoder. Best novel-class
-validation mIoU 0.056.
+A model that cannot run is skipped with the reason and the exit status is non-zero; the rest
+still run. Results computed on different episode lists are refused, never merged.
 
-The diagnosis was that the frozen decoder had never been trained to interpret MLP-generated
-tokens, so all gradient had to squeeze through it into a ~400 K-parameter MLP. SAM 3
-(released 19 Nov 2025) makes that architecture redundant: its **Promptable Concept
-Segmentation** accepts image exemplars natively, through an exemplar encoder and fusion
-encoder trained end-to-end for exactly this. Tsai et al. (arXiv 2604.05433) report
-state-of-the-art few-shot segmentation from a **fully frozen** SAM 3 with no training at all.
+## Protocol
 
-Different foundation model, different dataset, different training regime — effectively no
-shared surface beyond the ecological index code, which is carried over here with the border
-fix applied.
+- **SAM 1 / SAM 2:** identical PerSAM-style front end ([models/persam.py](models/persam.py)): support
+  mask → feature prototype → cosine map on the query → point/box prompts → pick the candidate
+  closest to the prototype. Only the encoder/decoder differ.
+- **SAM 3:** Hugging Face `transformers`, FSS-SAM3 spatial-concatenation canvas with one exemplar
+  box on the support half ([models/sam3_fss.py](models/sam3_fss.py)). SAM 3 cannot take a reference
+  from another image, so this is its available few-shot recipe. The comparison is therefore
+  *model + its best available few-shot recipe*, not bare encoders.
+- **Episodes:** class covers 2%–90% of both patches (the cap stops "predict everything" scoring
+  ~1.0); support ≠ query; cross-domain when the data has ≥ 2 FLAIR domains, otherwise same-domain
+  with a loud warning.
+- **Metrics:** class-accumulated mIoU (standard few-shot) as headline; mean-of-episodes mIoU and
+  FB-IoU beside it; `all_fg` / `empty` baselines always listed; paired bootstrap on differences.
+- **Figures:** 10 episodes chosen by a fixed rule after all runs (largest disagreement / all
+  succeed / all fail), never by hand. `figures/manifest.json` records why each was chosen.
 
----
+## Data
+
+[FLAIR](https://ignf.github.io/FLAIR/) (IGN, France): 512×512 patches at 0.20 m, Open Licence 2.0 /
+etalab-2.0 (attribution required). Both FLAIR #1 (`IMG_*/MSK_*`, classes 1–19) and FLAIR-HUB
+(`*_AERIAL_RGBI_*` / `*_AERIAL_LABEL-COSIA_*`, labels 0–18 in a different order, remapped on read) are
+supported. `scripts/download_toy.sh` fetches the FLAIR-HUB toy set (250 patches, 10 domains). Cite the FLAIR papers
+([#1](https://arxiv.org/abs/2211.12979), [#2](https://arxiv.org/abs/2305.14467)).
+**Channel order is not assumed** — the IGN dataset card says R,G,B,NIR,nDSM; earlier code assumed
+B,G,R. `run.sh` settles it on your files.
 
 ## Layout
 
 ```
-datasets/flair.py         FLAIR loader; composites, domain splits, class index
-ecological/indices.py     NDVI and local Shannon entropy (border artefact fixed)
-models/                   SAM 3 wrapper — not yet written
-scripts/download_toy.sh   fetch the ~750 MB toy subset
-scripts/inspect_flair.py  verify band order and report per-class NDVI/height
-tests/test_flair.py       loader logic tests; TIFF I/O stubbed, runs without data
+run.sh                       the one command
+datasets/flair_rgb.py        RGB-only access; band_order is a required argument
+evaluation/                  episodes, metrics, band decision rule, report helpers
+models/persam.py             SAM 1 / SAM 2 (adapters + shared front end)
+models/sam3_fss.py, canvas.py, prompting.py    SAM 3 canvas pipeline
+scripts/                     check_bands, make_episodes, run_model, report, preflight, prefetch_weights
+tests/                       no data/GPU/weights needed (test_run_sh.py runs run.sh end to end on synthetic TIFFs)
+datasets/flair.py, ecological/   legacy (NDVI/Shannon composites); only helpers are still used
 ```
 
----
-
-## Status
-
-Loader, ecological channels and verification tooling are in place and tested. The SAM 3
-integration is not yet written.
-
-Not yet verified against real FLAIR files — the assumptions in `inspect_flair.py` exist
-precisely because they have not been checked against a download.
-
----
-
-## Citation
-
-FLAIR is © IGN under Open Licence 2.0. Cite the FLAIR papers
-([#1](https://arxiv.org/abs/2211.12979), [#2](https://arxiv.org/abs/2305.14467),
-[country-scale](https://arxiv.org/abs/2310.13336)) in any write-up that uses the data.
+SAM licence: SAM 3 is under the SAM License (acknowledgement required in publications).

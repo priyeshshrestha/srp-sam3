@@ -1,108 +1,122 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+## What this repo is (restart of 2026-09-30)
+
+Two experiments:
+1. **Few-shot comparison** (`run.sh`): SAM 1, SAM 2 and SAM 3, one-/five-shot and training-free, on identical
+   **FLAIR RGB** episodes — numbers plus 10 qualitative figures.
+2. **Training** (`run_train.sh`, added 2026-10-17): SAM 3 fine-tuned (LoRA + semantic head) on FLAIR, **RGB vs
+   RGB+NIR**, identical otherwise — does SAM 3 get better when trained to use NIR? The EU UAV target has NIR.
+No elevation, ever. The earlier "ecological priors" direction is parked (history in `PROJECT_STATE.md`).
 
 ## Commands
 
 ```bash
-pip install -r requirements.txt
+bash run.sh check        # preflight only
+bash run.sh prefetch     # cache SAM 3 weights (needs internet + `hf auth login`)
+bash run.sh              # everything: tests -> data -> band order -> episodes -> models -> report
+python tests/test_benchmark.py   # no data/GPU/weights;  also: test_flair.py, test_canvas_prompting.py
+python tests/test_run_sh.py      # runs run.sh end to end on synthetic TIFFs (needs tifffile; skips otherwise)
 
-bash scripts/download_toy.sh ./data        # ~750 MB FLAIR-HUB toy subset
-python scripts/inspect_flair.py --root ./data
-python tests/test_flair.py                 # plain asserts in __main__, not pytest; runs all, no selection
+bash run_train.sh check          # training experiment: preflight only   (also: bash run.sh train)
+bash run_train.sh                # probe memory -> queue runs onto free GPUs -> evaluate -> report  (run in tmux)
+bash run_train.sh status         # what is running / waiting / done
+bash run_train.sh diagnose       # does the RGB+NIR model use NIR? filter sizes, loss curves, NIR ablation (1 GPU)
+MAX_GPUS=2 bash run_train.sh     # cap: at most 2 of our runs at once, on the most-free GPUs (live: echo n > <T>/max_gpus)
+python tests/test_train.py; python tests/test_gpu_queue.py; python tests/test_run_train_sh.py
 ```
 
-Run scripts from the repo root — they insert the project root into `sys.path` themselves.
+Tests are plain asserts in `__main__`, not pytest. Run scripts from the repo root. **Keep the tests
+data-free and GPU-free** — a test needing a download is a test nobody runs. `run.sh` is itself tested
+(`test_run_sh.py`, using the explicit `mock` model): if you change `run.sh` or the stage scripts, run it.
 
-`tests/test_flair.py` stubs `datasets.flair._read_tif`, so it needs **no data and no raster
-library**. It runs on any machine. Keep it that way: a test that needs a 750 MB download is a
-test nobody runs.
+## Rules that protect the science
 
-## The point of the project
+- **`band_order` has no default** (`datasets/flair_rgb.py`). The IGN dataset card says R,G,B,NIR,nDSM;
+  the old loader assumed B,G,R with no source. `run.sh` decides from the files (soil/water colour
+  statistics + an rgb/bgr montage) and **stops rather than guessing**. A wrong order feeds every model
+  a colour-swapped image. All Phase 3 numbers are unverified for this reason.
+- **Every model runs the same `episodes.json`.** Eligibility is data-only (class covers 2%-90% of both
+  patches, support != query, cross-domain when >= 2 domains). Never filter episodes per model. Each
+  run records `episodes_sha`; `run_model.py` and `report.py` refuse to mix different episode files.
+- **Always show the `all_fg` baseline** beside model numbers. A class that fills the frame makes
+  "predict everything" score ~1.0 (how an earlier 51.64% IoU was meaningless). Also report the
+  empty-prediction rate (SAM 3 is instance-based and may return nothing on "stuff" classes).
+- **Figures are chosen by rule after all runs** (`evaluation/report_lib.select_figure_episodes`),
+  never by hand.
+- **Fairness caveat:** SAM 1/2 use PerSAM-style prompting; SAM 3 uses the FSS-SAM3 canvas + one exemplar
+  box. The comparison is *model + its best available few-shot recipe*. Say so whenever quoting numbers.
+- **Arms:** `1shot`/`5shot` are the task; `oracle` takes its prompt from the query's own ground truth
+  (upper bound, never a method); `text` is SAM 3 with a fixed class phrase (`CLASS_PHRASES`, chosen
+  before any result). 5-shot uses `supports[:5]` of the same episodes, so 1- and 5-shot stay paired.
+- **The deck contains no typed-in results.** `presentation/build_deck.py` computes every number, chart
+  and prediction image from `outputs/runs`, `outputs/ndvi` and `outputs/train/report` (training experiment); only the recap numbers (previous
+  presentation) and cited literature facts are fixed text. Do not add invented or placeholder results.
+- **Training: RGB and RGBI runs differ ONLY in the input channels.** Same seed -> same images, augmentations,
+  prompts (`rng([seed, item])` in `train/data.py`) and same LoRA init; NIR filters start at zero (= exactly
+  pretrained SAM 3). Test domains are held out whole. `run_train.sh` refuses runs made with other settings.
+  Report the paired RGBI - RGB difference with its CI and the zero-shot reference, never one arm alone.
+- **The cluster GPUs are shared with other students.** Never assume a free GPU; `scripts/gpu_queue.py` starts
+  runs only where free memory fits, and every run must stay resumable (exit 3 = out of memory = re-queue).
+- **`mock` / `tiny` are not models.** It exists to test the pipeline; runs are tagged `is_measurement: false` and
+  the report prints a warning. Never cite its numbers.
+- **Secrets:** never write tokens, passwords, IPs or hostnames into the repo. Hugging Face auth comes
+  from `hf auth login` / `HF_TOKEN`; checkpoints come from `--checkpoint` / env vars, never hardcoded.
+  The repository is **public**: no student IDs, local paths or cluster addresses either (IDs live in the git-ignored
+  `presentation/team_ids.local.txt`). The old commit with a cluster password was removed before the first push (2026-11-08).
 
-A frozen RGB-only foundation model has three input slots; multispectral aerial imagery has
-five channels. **Which three, and do derived ecological quantities beat raw colour for
-few-shot vegetation segmentation?**
+## Code map
 
-`FLAIRDataset(composite=...)` is that experiment. Because the intended pipeline is
-training-free SAM 3, the composite is the *only* moving part — no learning rate, no episode
-count, nothing else to confound it. Preserve that property. If you find yourself adding a
-trainable component, stop and reconsider: it costs the project its cleanest measurement.
+| File | Role |
+|---|---|
+| `run.sh` | The one command; preflight, per-model isolation, resumable, non-zero exit if anything was skipped |
+| `datasets/flair_rgb.py` | RGB patches + masks, class counts, domains; all paths relative to the data root |
+| `evaluation/episodes.py` | Episode generation, `episodes_hash` |
+| `evaluation/metrics.py` | IoU, class-accumulated mIoU, FB-IoU, baselines, paired bootstrap |
+| `evaluation/bands.py` | `decide_band_order` (conservative; None when unsure) |
+| `evaluation/report_lib.py` | Loading runs, figure-episode selection |
+| `models/persam.py` | SAM 1 / SAM 2 adapters + shared prototype-matching front end |
+| `models/sam3_fss.py`, `canvas.py`, `prompting.py` | SAM 3 via transformers + canvas geometry + exemplar-box choice |
+| `scripts/` | `check_bands`, `make_episodes`, `run_model` (arms: `--prompt fewshot/oracle/text`, `--k_shot`), `report`, `ndvi_indicators`, `preflight`, `prefetch_weights`, `download_toy.sh` |
+| `run_train.sh` | Training experiment: preflight, memory probe, GPU queue, train + eval per run, report |
+| `train/sam3_rgbi.py` | SAM 3 with widened (zero-init NIR) patch embedding, LoRA, semantic head; `TinySeg` stand-in |
+| `train/data.py`, `train/metrics.py` | RGBI loading, held-out-domain split, paired training schedule; mIoU, paired bootstrap |
+| `scripts/train_sam3.py`, `eval_sam3.py`, `train_report.py`, `gpu_queue.py`, `make_split.py` | Training-experiment stages |
+| `presentation/build_deck.py` | Builds the final deck (template of the previous presentation) **only from real runs**; `render_keynote.sh` exports .key/.pdf/PNGs |
+| `datasets/flair.py`, `ecological/` | Legacy composite/NDVI/Shannon code. Only `_read_tif`, `mask_path_for`, `domain_of`, `FLAIR_CLASSES` are used. |
 
-## The elevation constraint — read before touching composites
+## FLAIR facts
 
-**The EU UAV target data carries RGB + NIR and NO elevation.** FLAIR has a per-pixel nDSM;
-the deliverable sensor does not. Anything whose result depends on canopy height cannot ship.
+Two releases are supported and both are read into **FLAIR #1 class ids (1-19)** everywhere:
 
-- Main experimental path uses `FLAIRDataset.ELEVATION_FREE` only:
-  `rgb`, `cir`, `ndvi_h_nir`, `rgb_ndvi`.
-- `ndvi_dsm_h` and `rgb_dsm` (`ELEVATION_DEPENDENT`) and `shannon_source="elevation"` and
-  `--use_elevation` are retained **solely as a FLAIR-only diagnostic** — they answer "how
-  much would canopy height buy if the payload had it?", which is a reportable question
-  about what the EU UAV sensor is missing. Never a headline method.
-- Selecting any of them prints a warning; results record `uses_elevation` and
-  `transfers_to_rgb_nir`, and `run.sh` marks non-transferable rows in its summary.
-- `test_elevation_free_composites_ignore_the_dsm` asserts this mechanically: perturb the
-  nDSM and every elevation-free composite must be bit-identical.
+- **FLAIR #1** (what Phase 3 used): `.../D041_2021/aerial/Z*/IMG_*.tif` + `labels/.../MSK_*.tif`,
+  5 channels, masks 1-19 with **no class 0**.
+- **FLAIR-HUB** (what `scripts/download_toy.sh` actually fetches): `D069-2020_AERIAL_RGBI/<roi>/
+  D069-2020_AERIAL_RGBI_<roi>_<x-y>.tif` (4 bands **R,G,B,NIR**, uint8, LZW -> needs `imagecodecs`)
+  + `..._AERIAL_LABEL-COSIA_...` labels. **COSIA labels are 0-18 in a different order** (0 = building,
+  12 = deciduous, 13 = coniferous...). `datasets/flair_rgb.HUB_TO_FLAIR1` remaps them (source: class
+  table in github.com/IGNF/FLAIR-HUB); `read_label` applies it. Never read HUB labels with `_read_tif`
+  directly. The toy set has 250 aerial patches from 10 domains (2019-2021).
+- **Band order:** FLAIR-HUB is `rgb`, confirmed on the files (soil ch0-ch2 = +20.5, water -28.8, montage).
+  FLAIR #1 is still unverified on files; its dataset card says R,G,B,NIR,nDSM while the legacy loader
+  assumed B,G,R, so **Phase 3 very likely ran on colour-swapped images.**
+- Domains: `D041_2021` / `D041-2021`; `domain_of` normalises both to `D041_2021`.
+- Default evaluation classes are 1-12. NIR (channel 3 in both releases) is used only by
+  `scripts/ndvi_indicators.py` and the training experiment (`train/`); height is never used (the EU UAV
+  target has NIR but no height).
+- Licence: Open Licence 2.0 / etalab-2.0 (attribution). SAM 3: SAM License (acknowledgement required in publications).
 
-This reverses an earlier recommendation. `shannon_source="elevation"` is a better
-structural measure and survives leaf-off, but it does not transfer, so the default is
-entropy over NDVI.
+## Model facts (verified where marked)
 
-## FLAIR facts that are easy to get wrong
-
-- **Channel order is B, G, R, NIR, Elevation.** BGR-first, and NIR is index **3**, not 4.
-  Constants `BLUE, GREEN, RED, NIR, ELEV` exist in `datasets/flair.py` — use them, never
-  integer literals.
-- **Channel 4 is nDSM in metres, not an 8-bit DN.** It must not be divided by 255 along with
-  the optical bands. It is clipped to `elevation_clip_m` (default 30 m) and normalised
-  separately. `test_elevation_scaling` guards this.
-- **Mask IDs are 1–19. There is no class 0.** Anything assuming 0-based or background-at-0
-  will silently mislabel `building`.
-- The band order is taken from the FLAIR *specification*, not read from the files. It is
-  load-bearing for every NDVI value. `scripts/inspect_flair.py` verifies it empirically
-  (on a vegetated scene the true NIR band must be the brightest) — run it against any new
-  download before trusting a result.
-
-## Splitting
-
-Split by **domain**, never randomly. Use `split_by_domain`. FLAIR domains (`D004_2021`) vary
-by department *and* acquisition date, so holding them out tests geographic and seasonal
-transfer. Neighbouring patches share appearance and lighting, so a random patch split leaks.
-
-For few-shot, use the rotating `FOLDS` rather than a fixed novel pair — a mIoU averaged over
-two classes is high-variance and easy to attack. `VEGETATION_CLASSES` is available for an
-ecologically-motivated split, but note it recreates a hard base→novel distribution gap
-(cartographic → ecological) that confounds "does few-shot work" with "does that transfer
-work".
-
-## Shannon entropy
-
-`compute_shannon_entropy_torch` defaults to `padding_mode="replicate"`. **Do not change this
-back to zero padding.** Zero padding makes windows at the patch edge see phantom pixels
-belonging to no bin, so probabilities stop summing to 1 and the entropy formula reads the
-deficit as diversity — a ring of fabricated heterogeneity ~0.13 wide on a *uniform* input,
-scaling with window size. `padding_mode="zeros"` remains only for reproducing the
-predecessor's numbers.
-
-`shannon_source` defaults to `"ndvi"`. `"elevation"` computes entropy over canopy height,
-which is closer to the landscape-metric meaning and survives leaf-off — but it needs the
-nDSM, so it is a FLAIR-only diagnostic (see the elevation constraint above).
-
-Window size is in pixels at 0.20 m GSD — a 7 px window spans 1.4 m. Sweep it; the
-predecessor never did, and its Shannon channel failed to separate any classes.
-
-## Context
-
-Predecessor: `../SRP/` (Phase 1) and `../SRP II.zip/` (Phase 2) — SAM v1 ViT-B on ISPRS
-Potsdam, episodic training, best novel mIoU 0.056. `../SRP/SRP_MASTER_SUMMARY.md` has the
-full review of why that stalled. The short version: the frozen SAM mask decoder was never
-trained to interpret MLP-generated prompt tokens, and SAM 3's native exemplar prompting makes
-that whole apparatus unnecessary.
-
-Potsdam was flown leaf-off (tree NDVI ≈ 0.207, overlapping bare soil), so it could not test
-the ecological hypothesis at all. That is the main reason for moving to FLAIR.
-
-Do not copy code from the predecessor without re-reading it. `ecological/indices.py` was
-carried over and then fixed; other files there carry known defects documented in
-`../SRP/CLAUDE.md`.
+- SAM 3 through Hugging Face `transformers` (`Sam3Model`, `Sam3Processor`) runs on Python 3.11 (verified on a
+  Mac/MPS; the cluster has transformers 5.18.0, the same version, torch 2.5.1+cu121, driver CUDA 12.2).
+  SAM 3 has **840.6 M** parameters (vision 454 M, text 353.5 M). The only 3-channel layer is the patch
+  embedding (Conv2d 3->1024, 14x14, no bias). `Sam3VisionModel` refuses HF gradient checkpointing; `train/`
+  wraps layers itself. Its built-in `semantic_seg` head (one map per prompt, 288x288) is what we train.
+- Cluster: 8x RTX A4000 16 GB, **shared** (other students' jobs use 1-13 GB per card at any time). The native
+  `sam3` package, not used here, reportedly needs Python >= 3.12 / CUDA >= 12.6 (unverified).
+- SAM 3 cannot take an exemplar from another image; the canvas (support + query on one 1008x1008 image,
+  support gets 60%) is the workaround. The support *mask* never reaches the model, only one box.
+- SAM 2 has no public embedding accessor; `persam.py` reads `predictor._features["image_embed"]`
+  (verified with sam2 1.1.0). SAM 1/2 need square inputs here (FLAIR patches are).
+- Previous result (unverified, possibly band-swapped): SAM 1 ViT-B + PerSAM, 1-shot, mIoU 0.286 on one domain.
