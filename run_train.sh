@@ -14,6 +14,13 @@
 #   bash run_train.sh status     what is running / waiting / done
 #   bash run_train.sh diagnose   does the RGB+NIR model use NIR? (filter sizes, loss curves, NIR ablation; 1 GPU)
 #
+# NIR robustness and few-shot adaptation (added 2026-11-17; need finished runs):
+#   ARMS=rgbiaug bash run_train.sh   NIR-robust training: RGB+NIR with random NIR gain/offset/gamma and 20% "no NIR"
+#                                    (train/nir.py). Same images/prompts/seeds as rgbi_s<seed>; only NIR values differ.
+#   bash run_train.sh shift          every finished run under simulated NIR cameras (+ label-free calibration)
+#   bash run_train.sh adapt          K-shot adaptation of ADAPT_RUNS to unseen test domains (new region / new camera)
+#   bash run_train.sh robust_report  tables + figures -> outputs/train/robust_report/summary.md (CPU only)
+#
 # Runs:
 #   rgb_s<seed>, rgbi_s<seed>   for every seed in SEEDS: train, then evaluate on held-out domains
 #   zeroshot_rgb                untrained SAM 3 with the same 12 text prompts (what training buys)
@@ -59,6 +66,12 @@
 #   PYTHON           interpreter                                            [python, else python3]
 #   SKIP_TESTS       1 = skip the unit tests                                [0]
 #   MODEL            sam3 (the experiment) | tiny (pipeline test stand-in, NOT a result)  [sam3]
+#   ARMS             which arms to train per seed: rgb | rgbi | rgbiaug (NIR-robust)   [rgb rgbi]
+#   SHIFT_N          test patches for `shift` (same fixed subset for every run)          [500]
+#   SHIFT_CONDITIONS NIR conditions for `shift` (see scripts/nir_shift.py)               [script default]
+#   ADAPT_RUNS       runs to adapt in `adapt`                          [rgb_s0 rgbi_s0 rgbiaug_s0, those that exist]
+#   ADAPT_DOMAINS / ADAPT_K / ADAPT_STEPS / ADAPT_LR / ADAPT_EVAL_N / ADAPT_CONDITIONS
+#                    see scripts/adapt_kshot.py                    [4 / "1 5 20" / 100 / 5e-5 / 200 / script default]
 # =============================================================================
 set -uo pipefail
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -89,6 +102,17 @@ export DEVICE="${DEVICE:-auto}"
 GPUS="${GPUS:-}"
 MAX_GPUS="${MAX_GPUS:-}"
 DIAG_N="${DIAG_N:-1000}"
+ARMS="${ARMS:-rgb rgbi}"
+SHIFT_N="${SHIFT_N:-500}"
+SHIFT_CONDITIONS="${SHIFT_CONDITIONS:-}"
+ADAPT_RUNS="${ADAPT_RUNS:-rgb_s0 rgbi_s0 rgbiaug_s0}"
+ADAPT_DOMAINS="${ADAPT_DOMAINS:-4}"
+ADAPT_K="${ADAPT_K:-1 5 20}"
+ADAPT_STEPS="${ADAPT_STEPS:-100}"
+ADAPT_LR="${ADAPT_LR:-5e-5}"
+ADAPT_EVAL_N="${ADAPT_EVAL_N:-200}"
+ADAPT_CONDITIONS="${ADAPT_CONDITIONS:-}"
+X="$T/extra"          # job markers + logs of the shift / adapt queues (separate lock from the training queue)
 
 dev_for() { [ "$1" = "cpu" ] && echo cpu || echo cuda; }
 gpu_env() { [ "$1" = "cpu" ] && echo "" || echo "$1"; }
@@ -105,10 +129,15 @@ run_job() {   # run_job <tag> <gpu> <batch> <accum>
             --channels rgb "${C[@]}" --out "$dir" --limit "$TEST_LIMIT" --workers "$WORKERS" --device "$dev"
         rc=$?; [ $rc -eq 0 ] || return $rc
     else
-        local ch="${tag%_s*}" seed="${tag##*_s}"
+        local arm="${tag%_s*}" seed="${tag##*_s}" ch aug=()
+        case "$arm" in
+            rgb|rgbi) ch="$arm" ;;
+            rgbiaug)  ch=rgbi; aug=(--nir_aug) ;;
+            *) echo "unknown arm '$arm' in run tag '$tag' (rgb | rgbi | rgbiaug)"; return 1 ;;
+        esac
         CUDA_VISIBLE_DEVICES="$(gpu_env "$g")" $PYTHON scripts/train_sam3.py --model "$MODEL" --steps "$STEPS" \
             --lr "$LR" --prompts "$PROMPTS" --lora_rank "$LORA_RANK" --workers "$WORKERS" "${C[@]}" \
-            --channels "$ch" --seed "$seed" --batch "$b" --accum "$acc" --out "$dir" --device "$dev"
+            --channels "$ch" "${aug[@]}" --seed "$seed" --batch "$b" --accum "$acc" --out "$dir" --device "$dev"
         rc=$?; [ $rc -eq 0 ] || return $rc
         CUDA_VISIBLE_DEVICES="$(gpu_env "$g")" $PYTHON scripts/eval_sam3.py --run "$dir" "${C[@]}" \
             --limit "$TEST_LIMIT" --workers "$WORKERS" --device "$dev"
@@ -117,11 +146,77 @@ run_job() {   # run_job <tag> <gpu> <batch> <accum>
     touch "$dir/DONE"
 }
 
-# Internal: the GPU queue calls   bash run_train.sh _job <tag> <gpu> <batch> <accum>
-if [ "$MODE" = "_job" ]; then
+# One shift / adapt job (tag shift_<run> or adapt_<run>) on one GPU. Exit 3 = out of GPU memory.
+run_xjob() {   # run_xjob <tag> <gpu> <batch> <accum>
+    local tag="$1" g="$2" b="$3" rc kind="${1%%_*}" run="${1#*_}"
+    local dev; dev="$(dev_for "$g")"
+    local -a cond=()
+    case "$kind" in
+        shift)
+            [ -n "$SHIFT_CONDITIONS" ] && read -r -a cond <<< "--conditions $SHIFT_CONDITIONS"
+            CUDA_VISIBLE_DEVICES="$(gpu_env "$g")" $PYTHON scripts/nir_shift.py --run "$T/runs/$run" --train_dir "$T" \
+                --root "$FLAIR_DATA_DIR" --band_order "$BAND_ORDER" --n_images "$SHIFT_N" "${cond[@]}" --device "$dev"
+            rc=$? ;;
+        adapt)
+            [ -n "$ADAPT_CONDITIONS" ] && read -r -a cond <<< "--conditions $ADAPT_CONDITIONS"
+            local -a ks; read -r -a ks <<< "$ADAPT_K"
+            CUDA_VISIBLE_DEVICES="$(gpu_env "$g")" $PYTHON scripts/adapt_kshot.py --run "$T/runs/$run" --train_dir "$T" \
+                --root "$FLAIR_DATA_DIR" --band_order "$BAND_ORDER" --domains "$ADAPT_DOMAINS" --ks "${ks[@]}" \
+                --steps "$ADAPT_STEPS" --lr "$ADAPT_LR" --eval_n "$ADAPT_EVAL_N" --batch "$b" "${cond[@]}" --device "$dev"
+            rc=$? ;;
+        *) echo "unknown job '$tag'"; return 1 ;;
+    esac
+    [ $rc -eq 0 ] || return $rc
+    mkdir -p "$X/jobs/$tag"; touch "$X/jobs/$tag/DONE"
+}
+
+# Internal: the GPU queue calls   bash run_train.sh _job <tag> <gpu> <batch> <accum>   (or _xjob)
+if [ "$MODE" = "_job" ] || [ "$MODE" = "_xjob" ]; then
     [ -n "$BAND_ORDER" ] || { echo "internal error: BAND_ORDER not passed to the job"; exit 1; }
-    run_job "$2" "$3" "$4" "$5"
+    if [ "$MODE" = "_job" ]; then run_job "$2" "$3" "$4" "$5"; else run_xjob "$2" "$3" "$4" "$5"; fi
     exit $?
+fi
+if [ "$MODE" = "robust_report" ]; then
+    $PYTHON scripts/robust_report.py --train_dir "$T"
+    exit $?
+fi
+if [ "$MODE" = "shift" ] || [ "$MODE" = "adapt" ]; then
+    mkdir -p logs "$X/jobs" "$X/logs"
+    [ -n "$BAND_ORDER" ] || BAND_ORDER="$(tr -d '[:space:]' < "$T/band_order.txt" 2>/dev/null)"
+    [ -n "$BAND_ORDER" ] || { echo "ERROR: BAND_ORDER unknown (set BAND_ORDER=rgb, or run run_train.sh first)"; exit 1; }
+    export BAND_ORDER
+    [ -f "$T/split.json" ] || { echo "ERROR: $T/split.json missing: run the training first"; exit 1; }
+    XJOBS=()
+    if [ "$MODE" = "shift" ]; then
+        for d in "$T"/runs/rgb_s* "$T"/runs/rgbi_s* "$T"/runs/rgbiaug_s*; do
+            [ -f "$d/final.pt" ] && XJOBS+=("shift_$(basename "$d")")
+        done
+    else
+        for r in $ADAPT_RUNS; do
+            if [ -f "$T/runs/$r/final.pt" ]; then XJOBS+=("adapt_$r"); else echo "  (skipping $r: not trained yet)"; fi
+        done
+    fi
+    [ "${#XJOBS[@]}" -gt 0 ] || { echo "ERROR: no finished training runs under $T/runs"; exit 1; }
+    # the scripts skip finished work themselves, so a re-run (e.g. with more conditions) only does what is new
+    for t in "${XJOBS[@]}"; do rm -f "$X/jobs/$t/DONE"; done
+    echo "$MODE: ${XJOBS[*]}   (log per job: $X/logs/<job>.log)"
+    if command -v nvidia-smi >/dev/null 2>&1 && [ "$DEVICE" != "cpu" ] && [ "${GPUS:-}" != "cpu" ]; then
+        [ -f "$T/memory.json" ] || { echo "ERROR: $T/memory.json missing (made by the training run's memory probe)"; exit 1; }
+        if [ -n "$MAX_GPUS" ]; then echo "$MAX_GPUS" > "$X/max_gpus"; else rm -f "$X/max_gpus"; fi
+        read -r -a GL <<< "${GPUS:-all}"
+        $PYTHON scripts/gpu_queue.py run --tags "${XJOBS[@]}" --cmd "bash $(pwd)/run_train.sh _xjob" --mem "$T/memory.json" \
+            --runs_dir "$X/jobs" --logs_dir "$X/logs" --status "$X/queue_status.json" --gpus "${GL[@]}" \
+            --margin_gb "$MARGIN_GB" ${MAX_GPUS:+--max_parallel "$MAX_GPUS"} --max_parallel_file "$X/max_gpus"
+        rc=$?
+    else
+        rc=0
+        for t in "${XJOBS[@]}"; do
+            echo "  $t"
+            run_xjob "$t" cpu "$BATCH" "$ACCUM" >> "$X/logs/$t.log" 2>&1 || { echo "  FAILED $t (see $X/logs/$t.log)"; rc=2; }
+        done
+    fi
+    [ $rc -eq 0 ] && echo "$MODE finished. Next: bash run_train.sh robust_report"
+    exit $rc
 fi
 if [ "$MODE" = "diagnose" ]; then
     mkdir -p logs
@@ -156,6 +251,10 @@ EOF
     for f in "$T"/runs/*/train_log.jsonl; do
         [ -f "$f" ] && echo "  $(basename "$(dirname "$f")"): $(tail -n 1 "$f")"
     done
+    if [ -f "$X/queue_status.json" ]; then
+        echo "shift / adapt queue:"
+        $PYTHON -c "import json; s = json.load(open('$X/queue_status.json')); [print(f'  {t:22s} {r[\"status\"]}') for t, r in s['runs'].items()]"
+    fi
     exit 0
 fi
 
@@ -170,7 +269,7 @@ die()  { echo; echo "ERROR: $*"; echo "(log: $LOG)"; exit 1; }
 echo "SAM 3 RGB vs RGB+NIR training  |  $(date)  |  host $(hostname)"
 echo "python: $($PYTHON --version 2>&1)  |  data: $FLAIR_DATA_DIR  |  out: $T  |  model: $MODEL"
 [ "$MODEL" = "sam3" ] || echo "!! MODEL=$MODEL is a pipeline stand-in: its numbers are NOT results"
-[ "$MODE" = "run" ] || [ "$MODE" = "check" ] || die "unknown mode '$MODE' (use: run | check | status)"
+[ "$MODE" = "run" ] || [ "$MODE" = "check" ] || die "unknown mode '$MODE' (use: run | check | status | diagnose | shift | adapt | robust_report)"
 [ $NO_TMUX -eq 1 ] && [ "$MODE" = "run" ] && echo "!! Not inside tmux/screen: this may run for days. If your SSH session ends, it stops (it resumes when re-run)."
 
 # ---------------------------------------------------------------------------
@@ -320,7 +419,8 @@ EOF
 # ---------------------------------------------------------------------------
 say "8. Training + evaluation (queued onto whichever GPU has room; logs in $T/logs/)"
 JOBS=()
-for s in $SEEDS; do for ch in rgb rgbi; do JOBS+=("${ch}_s${s}"); done; done
+for arm in $ARMS; do case "$arm" in rgb|rgbi|rgbiaug) ;; *) die "ARMS: unknown arm '$arm' (rgb | rgbi | rgbiaug)";; esac; done
+for s in $SEEDS; do for arm in $ARMS; do JOBS+=("${arm}_s${s}"); done; done
 [ "$ZERO_SHOT" = "1" ] && JOBS+=("zeroshot_rgb")
 echo "  runs: ${JOBS[*]}"
 # Existing runs (finished or not) must have been started with the current settings and split.
@@ -360,9 +460,19 @@ fi
 
 DONE_DIRS=(); FAILED=()
 for tag in "${JOBS[@]}"; do
-    if [ -f "$T/runs/$tag/DONE" ]; then DONE_DIRS+=("$T/runs/$tag"); else FAILED+=("$tag"); fi
+    [ -f "$T/runs/$tag/DONE" ] || FAILED+=("$tag")
 done
-[ "${#DONE_DIRS[@]}" -gt 0 ] || die "no run finished; see $T/logs/"
+# the RGB vs RGB+NIR report covers every finished rgb / rgbi / zero-shot run, not only the arms run now
+for d in "$T"/runs/rgb_s* "$T"/runs/rgbi_s* "$T"/runs/zeroshot_rgb; do
+    [ -f "$d/DONE" ] && DONE_DIRS+=("$d")
+done
+ls -d "$T"/runs/*/DONE >/dev/null 2>&1 || die "no run finished; see $T/logs/"
+if ! ls "$T"/runs/rgb_s*/DONE >/dev/null 2>&1 || ! ls "$T"/runs/rgbi_s*/DONE >/dev/null 2>&1; then
+    echo; echo "No finished rgb AND rgbi runs yet: skipping the RGB vs RGB+NIR report."
+    [ "${#FAILED[@]}" -gt 0 ] && { echo "FAILED: ${FAILED[*]}"; exit 2; }
+    echo "Next for NIR-robust runs: bash run_train.sh shift ; bash run_train.sh adapt ; bash run_train.sh robust_report"
+    exit 0
+fi
 
 # ---------------------------------------------------------------------------
 say "9. Report (re-predicts the 10 figure patches, so it waits for a GPU with room)"

@@ -1,8 +1,9 @@
 # SAM 1 vs SAM 2 vs SAM 3 on FLAIR (few-shot), and SAM 3 trained with RGB vs RGB+NIR
 
-Which Segment Anything model is best at one-shot land-cover segmentation on FLAIR aerial
-imagery? Every model is frozen; nothing is trained. All three see the identical episodes
-(class, support patch, query patch), RGB only.
+Three parts: (1) which Segment Anything model is best at one-shot land-cover segmentation on FLAIR
+aerial imagery (frozen models, identical episodes, RGB only); (2) does SAM 3 get better when trained
+with NIR; (3) does that NIR gain survive a change of camera, and how well does the model adapt to a
+new region from a few labelled patches.
 
 Student Research Project 2025/26 · Group 7 · Universität Hildesheim, ISMLL.
 
@@ -45,6 +46,19 @@ bash presentation/render_keynote.sh presentation/out/SRP_Group7_Final.pptx   # .
 
 The deck is computed entirely from `outputs/runs` and `outputs/ndvi`: models or arms that have not run
 are marked pending, never filled in.
+
+## NIR robustness and few-shot adaptation (the contribution, 2026-11-17)
+
+The RGB+NIR model relies on NIR for trees, so a drone camera with a different NIR response could break it. These stages
+test that with simulated cameras, add NIR-robust training and label-free NIR calibration, and measure K-shot adaptation
+to unseen regions (plan and decision rule: top of [PROJECT_STATE.md](PROJECT_STATE.md)).
+
+```bash
+ARMS=rgbiaug ZERO_SHOT=0 MAX_GPUS=1 bash run_train.sh   # NIR-robust training next to the existing runs
+MAX_GPUS=1 bash run_train.sh shift                      # all finished runs under simulated NIR cameras (+ calibration)
+MAX_GPUS=2 bash run_train.sh adapt                      # K = 1, 5, 20 labelled patches from unseen domains
+bash run_train.sh robust_report                         # -> outputs/train/robust_report/summary.md
+```
 
 ## Training experiment: does SAM 3 improve when trained to use NIR?
 

@@ -76,6 +76,44 @@ def main():
         assert set(diag["ablation"]) == {"rgbi_s0", "rgbi_s1"} and "nir_swap" in diag["ablation"]["rgbi_s0"]
         assert diag["loss"]["rgb_s0"]["steps"] == 4
 
+        print("[run_train.sh] NIR-robust arm (ARMS=rgbiaug) next to the existing runs...")
+        r = run(tmp, ARMS="rgbiaug")
+        assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-1500:]
+        for tag in ("rgbiaug_s0", "rgbiaug_s1"):
+            assert os.path.exists(os.path.join(out, "runs", tag, "DONE")), tag
+        cfg2 = json.load(open(os.path.join(out, "runs", "rgbiaug_s0", "config.json")))
+        assert {k for k in cfg2 if cfg2[k] != cfg1.get(k, False)} == {"nir_aug"}, \
+            "the robust run must differ from the RGBI run only by nir_aug"
+        assert json.load(open(os.path.join(out, "report", "summary.json")))["seeds_paired"] == [0, 1]
+
+        print("[run_train.sh shift] simulated NIR cameras + calibration on every finished run...")
+        r = run(tmp, "shift", SHIFT_N="3")
+        assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-1500:]
+        for tag in ("rgb_s0", "rgbi_s0", "rgbiaug_s1"):
+            res = json.load(open(os.path.join(out, "shift", f"{tag}.json")))
+            assert res["n_images"] == 3 and ("calib:camera_b" in res["miou"]) == (tag != "rgb_s0"), res
+        r = run(tmp, "shift", SHIFT_N="3", SHIFT_CONDITIONS="offset_+20")     # adding a condition keeps the others
+        assert r.returncode == 0, r.stdout[-3000:]
+        res = json.load(open(os.path.join(out, "shift", "rgbi_s0.json")))
+        assert "offset_+20" in res["miou"] and "camera_b" in res["miou"], res
+
+        print("[run_train.sh adapt] K-shot adaptation to an unseen domain...")
+        r = run(tmp, "adapt", ADAPT_DOMAINS="1", ADAPT_K="1 2", ADAPT_STEPS="2", ADAPT_EVAL_N="2")
+        assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-1500:]
+        cells = os.listdir(os.path.join(out, "adapt", "rgbi_s0", "cells"))
+        assert len(cells) == 3 * 3, cells                   # 3 conditions x K in {0, 1, 2}
+        assert len(os.listdir(os.path.join(out, "adapt", "rgb_s0", "cells"))) == 3     # RGB: normal only
+
+        print("[run_train.sh robust_report] tables and figures...")
+        r = run(tmp, "robust_report")
+        assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-1500:]
+        md = open(os.path.join(out, "robust_report", "summary.md")).read()
+        for s in ("NOT results", "survive a change of NIR camera", "RGB+NIR robust", "Tree classes",
+                  "Few-shot adaptation", "K=2", "camera B"):
+            assert s in md, (s, md)
+        for f in ("gain_curve.png", "kshot_curve.png", "summary.json"):
+            assert os.path.exists(os.path.join(out, "robust_report", f)), f
+
         print("[run_train.sh] re-run resumes (nothing retrained)...")
         final = os.path.join(out, "runs", "rgb_s0", "final.pt")
         mtime = os.path.getmtime(final)

@@ -128,8 +128,12 @@ def main():
     mock = [r["name"] for r in runs if not r["meta"].get("is_measurement", True)]
 
     zs = [r for r in runs if r["meta"]["zero_shot"]]
-    by = {ch: {r["meta"]["seed"]: r for r in runs if not r["meta"]["zero_shot"] and r["meta"]["channels"] == ch}
-          for ch in ("rgb", "rgbi")}
+    # NIR-robust runs (nir_aug) belong to the robustness report (scripts/robust_report.py), not here
+    skipped = [r["name"] for r in runs if r["meta"].get("nir_aug")]
+    if skipped:
+        print(f"  not in this report (NIR-robust runs, see robust_report.py): {' '.join(skipped)}")
+    by = {ch: {r["meta"]["seed"]: r for r in runs if not r["meta"]["zero_shot"] and r["meta"]["channels"] == ch
+               and not r["meta"].get("nir_aug")} for ch in ("rgb", "rgbi")}
     seeds = sorted(set(by["rgb"]) & set(by["rgbi"]))
 
     def cond_stats(rs):
