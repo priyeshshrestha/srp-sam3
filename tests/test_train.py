@@ -214,6 +214,100 @@ def test_schedule_is_paired_across_channels():
     resumed = TrainSchedule(tmp, rels, "rgb", "rgbi", seed=3, n_items=10, start_item=6)
     assert torch.equal(resumed[0][0], b[6][0]), "resuming must continue the same schedule"
 
+    # NIR-robust training: same images, augmentations and prompts as the plain RGBI run; only NIR differs
+    from train.nir import NIR_MISSING
+    c = TrainSchedule(tmp, rels, "rgb", "rgbi", seed=3, n_items=40, nir_aug=True)
+    b40 = TrainSchedule(tmp, rels, "rgb", "rgbi", seed=3, n_items=40)
+    n_changed = n_missing = 0
+    for i in range(40):
+        xb, cb, tb, vb = b40[i]
+        xc, cc, tc, vc = c[i]
+        assert xc.dtype == torch.float32
+        assert torch.equal(xc[:3], xb[:3].float()) and torch.equal(cc, cb) and torch.equal(tc, tb), \
+            "the NIR-robust run must see the same RGB, augmentation and prompts"
+        assert 0 <= float(xc[3].min()) and float(xc[3].max()) <= 255
+        n_changed += not torch.equal(xc[3], xb[3].float())
+        n_missing += bool((xc[3] == NIR_MISSING).all())
+    assert 0 < n_missing < 40 and n_changed > n_missing, (n_changed, n_missing)
+    again = TrainSchedule(tmp, rels, "rgb", "rgbi", seed=3, n_items=40, nir_aug=True)
+    assert all(torch.equal(again[i][0], c[i][0]) for i in range(40)), "NIR augmentation must be deterministic"
+    try:
+        TrainSchedule(tmp, rels, "rgb", "rgb", seed=3, n_items=4, nir_aug=True)
+        raise AssertionError("nir_aug with RGB input must be refused")
+    except ValueError:
+        pass
+
+
+def test_nir_transforms():
+    from train.nir import NIR_MISSING, SHIFTS, apply_nir, parse_condition, random_nir, shift_nir
+    from train.sam3_rgbi import normalise
+    nir = np.linspace(0, 255, 256, dtype=np.float32).reshape(16, 16)
+    assert np.array_equal(shift_nir(nir, "normal"), nir)
+    assert np.allclose(shift_nir(nir, "gain_0.8"), nir * 0.8)
+    assert shift_nir(nir, "gain_1.4").max() == 255.0, "values must be clipped to the 8-bit range"
+    assert np.allclose(shift_nir(nir, "offset_-20"), np.clip(nir - 20, 0, 255))
+    g = shift_nir(nir, "gamma_1.25")
+    assert g[0, 0] == 0 and abs(g[-1, -1] - 255) < 1e-3 and (g[1:-1].mean() < nir[1:-1].mean())
+    cam = SHIFTS["camera_b"]
+    assert np.allclose(shift_nir(nir, "camera_b"), apply_nir(nir, **cam))
+    # "no NIR" normalises to exactly 0, so zero-initialised NIR filters see nothing
+    miss = shift_nir(nir, "missing")
+    assert float(normalise(torch.from_numpy(miss)).abs().max()) == 0.0 and miss[0, 0] == NIR_MISSING
+    assert parse_condition("calib:gain_0.6") == ("gain_0.6", True) and parse_condition("missing") == ("missing", False)
+    for bad in ("calib:missing", "gain_9", "calib:nope"):
+        try:
+            parse_condition(bad)
+            raise AssertionError(bad)
+        except ValueError:
+            pass
+    rng = np.random.default_rng(0)
+    outs = [random_nir(nir, rng) for _ in range(500)]
+    frac_missing = np.mean([np.all(o == NIR_MISSING) for o in outs])
+    frac_clean = np.mean([np.array_equal(o, nir) for o in outs])
+    assert 0.14 < frac_missing < 0.26 and 0.14 < frac_clean < 0.26, (frac_missing, frac_clean)
+    assert all(0 <= o.min() and o.max() <= 255 for o in outs)
+
+
+def test_calibration_undoes_a_camera_change():
+    from train.nir import calibrate, nir_moments, shift_nir
+    rng = np.random.default_rng(1)
+    flair = [np.clip(rng.normal(120, 30, (64, 64)), 0, 255).astype(np.float32) for _ in range(20)]
+    ref = nir_moments(flair)
+    for cond in ("gain_0.8", "offset_+20", "gain_1.2"):
+        cam = [shift_nir(n, cond) for n in flair]
+        src = nir_moments(cam)
+        back = [calibrate(n, src, ref) for n in cam]
+        m, s = nir_moments(back)
+        assert abs(m - ref[0]) < 1.0 and abs(s - ref[1]) < 1.0, (cond, (m, s), ref)
+        assert np.abs(back[0] - flair[0]).mean() < 2.0, cond
+    flat = calibrate(np.full((4, 4), 200, np.float32), (200.0, 0.0), ref)     # a flat band must not explode
+    assert np.isfinite(flat).all() and np.allclose(flat, ref[0])
+
+
+def test_old_configs_resume_with_new_keys():
+    import json
+    import subprocess
+    tmp = tempfile.mkdtemp()
+    from train.data import make_split as ms
+    rels = [f"D00{d}_2021/aerial/Z1/IMG_{d}{k}.tif" for d in (1, 2) for k in range(2)]
+    sp = ms(rels, mode="domain", seed=0)
+    with open(os.path.join(tmp, "split.json"), "w") as fh:
+        json.dump(sp, fh)
+    out = os.path.join(tmp, "run")
+    os.makedirs(out)
+    old = {"model": "tiny", "channels": "rgbi", "seed": 0, "steps": 4, "effective_batch": 8, "lr": 1e-4, "prompts": 3,
+           "lora_rank": 16, "split_sha": sp["sha"], "band_order": "rgb", "precision": "bf16"}   # written before nir_aug existed
+    with open(os.path.join(out, "config.json"), "w") as fh:
+        json.dump(old, fh)
+    open(os.path.join(out, "final.pt"), "w").close()
+    root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    base = [sys.executable, "scripts/train_sam3.py", "--model", "tiny", "--channels", "rgbi", "--root", tmp, "--split",
+            os.path.join(tmp, "split.json"), "--band_order", "rgb", "--out", out, "--steps", "4", "--device", "cpu"]
+    r = subprocess.run(base, cwd=root, capture_output=True, text=True)
+    assert r.returncode == 0 and "already finished" in r.stdout, r.stdout + r.stderr
+    r = subprocess.run(base + ["--nir_aug"], cwd=root, capture_output=True, text=True)
+    assert r.returncode != 0 and "nir_aug" in (r.stdout + r.stderr), "a plain run must not resume as a robust one"
+
 
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]

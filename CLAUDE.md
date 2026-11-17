@@ -7,6 +7,9 @@ Two experiments:
    **FLAIR RGB** episodes — numbers plus 10 qualitative figures.
 2. **Training** (`run_train.sh`, added 2026-10-17): SAM 3 fine-tuned (LoRA + semantic head) on FLAIR, **RGB vs
    RGB+NIR**, identical otherwise — does SAM 3 get better when trained to use NIR? The EU UAV target has NIR.
+3. **NIR robustness + few-shot adaptation** (added 2026-11-17, the contribution; plan at the top of `PROJECT_STATE.md`):
+   NIR-robust training (`ARMS=rgbiaug`), simulated NIR cameras + label-free calibration (`shift`), K-shot adaptation to
+   unseen domains (`adapt`), report (`robust_report`).
 No elevation, ever. The earlier "ecological priors" direction is parked (history in `PROJECT_STATE.md`).
 
 ## Commands
@@ -23,6 +26,10 @@ bash run_train.sh                # probe memory -> queue runs onto free GPUs -> 
 bash run_train.sh status         # what is running / waiting / done
 bash run_train.sh diagnose       # does the RGB+NIR model use NIR? filter sizes, loss curves, NIR ablation (1 GPU)
 MAX_GPUS=2 bash run_train.sh     # cap: at most 2 of our runs at once, on the most-free GPUs (live: echo n > <T>/max_gpus)
+ARMS=rgbiaug bash run_train.sh   # NIR-robust arm (random NIR gain/offset/gamma, 20% no NIR); pairs with rgbi_s<seed>
+bash run_train.sh shift          # every finished run under simulated NIR cameras (+ calib:), fixed test subset (SHIFT_N)
+bash run_train.sh adapt          # K-shot adaptation of ADAPT_RUNS to unseen test domains
+bash run_train.sh robust_report  # outputs/train/robust_report/summary.md + gain_curve.png + kshot_curve.png (CPU)
 python tests/test_train.py; python tests/test_gpu_queue.py; python tests/test_run_train_sh.py
 ```
 
@@ -56,6 +63,10 @@ data-free and GPU-free** — a test needing a download is a test nobody runs. `r
   prompts (`rng([seed, item])` in `train/data.py`) and same LoRA init; NIR filters start at zero (= exactly
   pretrained SAM 3). Test domains are held out whole. `run_train.sh` refuses runs made with other settings.
   Report the paired RGBI - RGB difference with its CI and the zero-shot reference, never one arm alone.
+- **NIR robustness:** transforms touch the NIR band only (`train/nir.py`), so the RGB model is the fixed reference in
+  every condition. The robust arm draws its NIR augmentation from a separate RNG stream: same images/augmentations/
+  prompts as `rgbi_s<seed>`, only NIR differs. Always report the out-of-training-range conditions (gain 0.6 / 1.4)
+  separately, and never tune the a-priori settings (augmentation ranges, test cameras, adaptation recipe) on results.
 - **The cluster GPUs are shared with other students.** Never assume a free GPU; `scripts/gpu_queue.py` starts
   runs only where free memory fits, and every run must stay resumable (exit 3 = out of memory = re-queue).
 - **`mock` / `tiny` are not models.** It exists to test the pipeline; runs are tagged `is_measurement: false` and
@@ -82,6 +93,8 @@ data-free and GPU-free** — a test needing a download is a test nobody runs. `r
 | `train/sam3_rgbi.py` | SAM 3 with widened (zero-init NIR) patch embedding, LoRA, semantic head; `TinySeg` stand-in |
 | `train/data.py`, `train/metrics.py` | RGBI loading, held-out-domain split, paired training schedule; mIoU, paired bootstrap |
 | `scripts/train_sam3.py`, `eval_sam3.py`, `train_report.py`, `gpu_queue.py`, `make_split.py` | Training-experiment stages |
+| `train/nir.py` | NIR-only transforms: simulated cameras, robust-training augmentation, moment-matching calibration |
+| `scripts/nir_shift.py`, `adapt_kshot.py`, `robust_report.py` | NIR-shift evaluation, K-shot adaptation, robustness report |
 | `presentation/build_deck.py` | Builds the final deck (template of the previous presentation) **only from real runs**; `render_keynote.sh` exports .key/.pdf/PNGs |
 | `datasets/flair.py`, `ecological/` | Legacy composite/NDVI/Shannon code. Only `_read_tif`, `mask_path_for`, `domain_of`, `FLAIR_CLASSES` are used. |
 

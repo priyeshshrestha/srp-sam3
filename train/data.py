@@ -136,8 +136,9 @@ def test_subset(split: Dict, limit: Optional[int]) -> List[str]:
 
 
 # ---------------------------------------------------------------------------------- datasets
-def to_model_input(x_uint8: np.ndarray, channels: str) -> torch.Tensor:
-    return torch.from_numpy(np.ascontiguousarray(x_uint8[:CHANNELS[channels]]))
+def to_model_input(x: np.ndarray, channels: str) -> torch.Tensor:
+    """uint8 (unchanged images) or float32 on the 0..255 scale (NIR transformed, see train/nir.py)."""
+    return torch.from_numpy(np.ascontiguousarray(x[:CHANNELS[channels]]))
 
 
 def sample_prompts(label: np.ndarray, n_prompts: int, rng: np.random.Generator) -> np.ndarray:
@@ -164,11 +165,20 @@ def augment(x: np.ndarray, y: np.ndarray, rng: np.random.Generator):
 
 
 class TrainSchedule(Dataset):
-    """Item k of the whole training run (k = step * batch + slot), deterministic in (seed, k)."""
+    """Item k of the whole training run (k = step * batch + slot), deterministic in (seed, k).
 
-    def __init__(self, root, rel_paths, band_order, channels, seed, n_items, n_prompts=3, start_item=0):
+    nir_aug (RGB+NIR only): NIR-robust training (train/nir.random_nir). Its random numbers come from a
+    SEPARATE generator rng([seed, k, NIR_STREAM]), so an augmented run sees exactly the same images,
+    rotations, flips and prompts as the plain RGB+NIR run of the same seed; only the NIR values differ."""
+
+    NIR_STREAM = 7
+
+    def __init__(self, root, rel_paths, band_order, channels, seed, n_items, n_prompts=3, start_item=0,
+                 nir_aug=False):
+        if nir_aug and channels != "rgbi":
+            raise ValueError("nir_aug needs channels='rgbi'")
         self.root, self.rel, self.band_order, self.channels = root, list(rel_paths), band_order, channels
-        self.seed, self.n_prompts, self.start = seed, n_prompts, start_item
+        self.seed, self.n_prompts, self.start, self.nir_aug = seed, n_prompts, start_item, nir_aug
         self.n_items = n_items
         n_epochs = n_items // len(self.rel) + 1
         g = np.random.default_rng([seed, 999_983])
@@ -185,6 +195,10 @@ class TrainSchedule(Dataset):
         cls = sample_prompts(y, self.n_prompts, rng)
         target = np.stack([(y == CLASSES[c]) for c in cls]).astype(np.float32)
         valid = (y >= 1) & (y <= 19)
+        if self.nir_aug:
+            from train.nir import random_nir
+            x = x.astype(np.float32)
+            x[3] = random_nir(x[3], np.random.default_rng([self.seed, k, self.NIR_STREAM]))
         return to_model_input(x, self.channels), torch.from_numpy(cls), torch.from_numpy(target), torch.from_numpy(valid)
 
 

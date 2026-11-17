@@ -4,6 +4,9 @@
     python scripts/train_sam3.py --channels rgbi --seed 0 --root $FLAIR_DATA_DIR \
         --split outputs/train/split.json --band_order rgb --out outputs/train/runs/rgbi_s0
 
+    --nir_aug   NIR-robust training (train/nir.py): random NIR gain/offset/gamma and 20% "no NIR".
+                Same images, augmentations and prompts as the plain RGB+NIR run of the same seed.
+
     --probe N   run N optimizer steps, print peak GPU memory and seconds/step, save nothing.
                 Exit 3 = out of GPU memory (run_train.sh then halves the batch).
 
@@ -29,7 +32,9 @@ from train.sam3_rgbi import PATCH_EMBED, build, load_trainable, normalise, train
 # (batch x accum may be re-split, e.g. after an out-of-memory probe: the data schedule depends only on
 # their product, so a run can resume with a different split of the same effective batch.)
 RUN_KEYS = ("model", "channels", "seed", "steps", "effective_batch", "lr", "prompts", "lora_rank",
-            "split_sha", "band_order", "precision")
+            "split_sha", "band_order", "precision", "nir_aug")
+# Keys added after the first runs: an older config.json without them had these values.
+KEY_DEFAULTS = {"nir_aug": False}
 
 
 def pick_device(name):
@@ -75,6 +80,7 @@ def main():
     ap.add_argument("--prompts", type=int, default=3, help="class prompts per image per step")
     ap.add_argument("--lora_rank", type=int, default=16)
     ap.add_argument("--precision", default="bf16", choices=["bf16", "fp32"])
+    ap.add_argument("--nir_aug", action="store_true", help="NIR-robust training (rgbi only, see train/nir.py)")
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--save_every", type=int, default=250, help="checkpoint every N steps ...")
     ap.add_argument("--save_minutes", type=float, default=10.0, help="... or every M minutes (shared GPUs: a run "
@@ -84,6 +90,8 @@ def main():
     ap.add_argument("--probe", type=int, default=0)
     a = ap.parse_args()
 
+    if a.nir_aug and a.channels != "rgbi":
+        sys.exit("ERROR: --nir_aug needs --channels rgbi")
     split = load_split(a.split)
     cfg = {k: getattr(a, k) for k in RUN_KEYS if hasattr(a, k)}
     cfg["split_sha"] = split["sha"]
@@ -95,7 +103,8 @@ def main():
         if os.path.exists(cfg_path):
             with open(cfg_path) as fh:
                 old = json.load(fh)
-            diff = {k: (old.get(k), cfg[k]) for k in RUN_KEYS if old.get(k) != cfg[k]}
+            diff = {k: (old.get(k, KEY_DEFAULTS.get(k)), cfg[k]) for k in RUN_KEYS
+                    if old.get(k, KEY_DEFAULTS.get(k)) != cfg[k]}
             if diff:
                 sys.exit(f"ERROR: {a.out} was started with different settings {diff}. Use a new --out "
                          f"or delete that directory; runs are never mixed.")
@@ -108,7 +117,8 @@ def main():
 
     dev = pick_device(a.device)
     amp = dev == "cuda" and a.precision == "bf16"
-    print(f"  device {dev}  |  bf16 autocast {amp}  |  {a.channels} ({CHANNELS[a.channels]} ch)  |  seed {a.seed}")
+    print(f"  device {dev}  |  bf16 autocast {amp}  |  {a.channels} ({CHANNELS[a.channels]} ch)  |  seed {a.seed}"
+          + ("  |  NIR-robust augmentation" if a.nir_aug else ""))
 
     torch.manual_seed(a.seed)
     net = build(a.model, CHANNELS[a.channels], a.lora_rank, seed=a.seed).to(dev)
@@ -133,7 +143,7 @@ def main():
     total = a.probe or a.steps
     per_step = a.batch * a.accum
     ds = TrainSchedule(a.root, split["train"], a.band_order, a.channels, a.seed, n_items=total * per_step,
-                       n_prompts=a.prompts, start_item=step * per_step)
+                       n_prompts=a.prompts, start_item=step * per_step, nir_aug=a.nir_aug)
     dl = DataLoader(ds, batch_size=a.batch, shuffle=False, num_workers=a.workers,
                     pin_memory=dev == "cuda", persistent_workers=False)
     warmup = max(1, min(200, a.steps // 10))

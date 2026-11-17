@@ -70,6 +70,7 @@ def main():
         if cfg["split_sha"] != split["sha"]:
             sys.exit(f"ERROR: {a.run} was trained on split {cfg['split_sha']}, not {split['sha']}")
         meta.update({k: cfg[k] for k in ("model", "channels", "seed")})
+        meta["nir_aug"] = bool(cfg.get("nir_aug", False))
     else:
         meta.update({"model": a.model, "channels": a.channels, "seed": None})
     meta["is_measurement"] = meta["model"] != "tiny"

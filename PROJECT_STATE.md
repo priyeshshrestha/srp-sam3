@@ -1,5 +1,94 @@
 # PROJECT STATE — full handoff
 
+## PLAN 2026-11-17 — 15 days left (deadline ~2 Dec): NIR robustness + few-shot adaptation
+
+**This is the plan until the deadline. Everything below this section is history.**
+
+### The story (our contribution)
+1. Training SAM 3 with NIR helps, mostly vegetation: +0.0095 mIoU [+0.008, +0.011], coniferous +0.06 (Exp. 3, done).
+2. But the RGB+NIR model **depends on NIR for trees** (NIR flattened: coniferous −0.21, deciduous −0.23 IoU) — a drone
+   camera with a different NIR response could break it (NIR diagnostic, done).
+3. **New:** (A) **NIR-robust training** (random NIR gain/offset/gamma + 20% "no NIR") and (B) **label-free NIR
+   calibration** (match each new domain's NIR mean/std to FLAIR's, from unlabelled images), evaluated under simulated
+   camera changes, plus **K-shot adaptation to unseen regions** (K = 1, 5, 20 labelled patches) — the drone scenario.
+
+Not novel on its own (be honest): SAM + few-shot (ViRefSAM, FSS-SAM3), SAM + NIR/NDVI (VegSAM), the +1-point NIR gain,
+the SAM 1/2/3 benchmark. The contribution is measuring the NIR dependence of a NIR-extended SAM 3 and fixing it for
+cross-camera / cross-region few-shot transfer. **Literature check still needed** on NIR/channel robustness for SAM-type
+models on aerial imagery (teammates, this week).
+
+### What is trustworthy
+| Work | Status |
+|---|---|
+| Band-order bug found + old numbers retired; evaluation protocol (cross-region, all_fg baseline, paired bootstrap, rule-chosen figures) | solid |
+| Exp. 3 RGB vs RGB+NIR (official split, 3 seeds, 4k + 12k steps) | solid — main measured result |
+| NIR diagnostic (tree reliance) | solid (4k models) |
+| NDVI read-out (r = 0.86) / NDVI filter hurts | toy subset only |
+| Few-shot SAM 1/2/3 | preliminary (toy, no SAM 1) — optional rerun only if a GPU is idle |
+| Never cite | 0.286, 51.64 %, the 0.0709→0.0560 "regression", HRNet recap until 0.580 vs 0.5134 is settled |
+
+### New code (branch `robust-nir-fewshot`)
+| File | Role |
+|---|---|
+| `train/nir.py` | NIR-only transforms: simulated cameras (`SHIFTS`), `random_nir` (robust training), `calibrate` (moment matching), `NIR_MISSING` = 127.5 (normalises to exactly 0 = "no NIR") |
+| `train/data.py` | `TrainSchedule(nir_aug=True)`: NIR augmentation from a separate RNG stream -> same images/augmentations/prompts as `rgbi_s<seed>` |
+| `scripts/train_sam3.py` | `--nir_aug`; `nir_aug` is a run key (old configs read as `False`) |
+| `scripts/nir_shift.py` | one run under all NIR conditions on a fixed test subset (paired), incl. `calib:<condition>` |
+| `scripts/adapt_kshot.py` | K-shot adaptation of a run to unseen test domains, conditions normal / camera_b / calib:camera_b |
+| `scripts/robust_report.py` | tables (shift, trees, adaptation) with paired 95% CIs + `gain_curve.png`, `kshot_curve.png` |
+| `run_train.sh` | `ARMS=rgbiaug`, modes `shift`, `adapt`, `robust_report` (separate GPU queue in `outputs/train/extra`) |
+| tests | `tests/test_train.py` (NIR transforms, calibration, pairing, old-config resume), `tests/test_run_train_sh.py` (all new stages end to end with `tiny`) |
+
+Settings fixed a priori (not tuned): augmentation p_missing 0.2, p_clean 0.2, gain U(0.7, 1.3), offset U(−25, 25),
+gamma log-U(0.8, 1.25); test cameras gain 0.6/0.8/1.2/1.4, gamma 1.25, camera_b = gain 0.8 + offset 15 + gamma 1.15;
+gain 0.6 and 1.4 are OUTSIDE the training range (report them separately). Adaptation: 100 steps, 4 images/step,
+lr 5e-5 (patch embedding 0.1×), 4 domains, 200 evaluation patches per domain, supports nested (K=1 ⊂ 5 ⊂ 20).
+
+### Commands, in order (cluster, `conda activate srp311`, inside tmux; `FLAIR_DATA_DIR` as before)
+```
+python tests/test_train.py && python tests/test_run_train_sh.py              # 3 min, no GPU
+# GPU 1: robust training, 4,000 steps, next to the existing 4k runs in outputs/train (~8-15 h per seed)
+ARMS=rgbiaug ZERO_SHOT=0 MAX_GPUS=1 bash run_train.sh
+# GPU 2, at the same time: the existing 4k models under simulated cameras (DECISION POINT, a few hours)
+MAX_GPUS=1 bash run_train.sh shift && bash run_train.sh robust_report
+# when the robust runs are done (both GPUs):
+MAX_GPUS=2 bash run_train.sh shift        # only the new runs are evaluated; finished ones are skipped
+MAX_GPUS=2 bash run_train.sh adapt        # rgb_s0, rgbi_s0, rgbiaug_s0 -> ~6-8 h per NIR run
+bash run_train.sh robust_report           # -> outputs/train/robust_report/summary.md + 2 figures
+```
+Never more than 2 GPUs in total (training queue + shift/adapt queue together).
+
+### Decision rule after the first `shift` report (day 1-2)
+- RGB+NIR falls below RGB under a plausible camera (gain 0.8 / camera_b) or without NIR -> the risk is real; main
+  claim = robust training and/or calibration remove it while keeping the clean-NIR gain.
+- RGB+NIR does NOT fall below RGB even at gain 0.6 / 1.4 -> report that honestly ("the NIR gain is robust to camera
+  changes of this size"); the main claim moves to K-shot adaptation to new regions.
+Either way the paper has a measured answer. Do not change the a-priori settings after seeing results.
+
+### 15-day schedule
+| Days | Dates | Do |
+|---|---|---|
+| 1 | Tue 17 – Wed 18 Nov | apply patch, run tests; start robust training (GPU 1) + `shift` on existing models (GPU 2); first report = decision point |
+| 2–4 | Wed 18 – Sat 21 | robust training finishes (3 seeds; if slower than expected, `SEEDS="0 1"` is the fallback). Optional on the idle GPU: few-shot SAM 1/2/3 rerun on full data |
+| 4–5 | Sat 21 – Sun 22 | `shift` on robust runs, `adapt`, `robust_report` |
+| 6 | Mon 23 | results freeze; copy `outputs/train/robust_report/` + `report/` to the Mac |
+| 7–11 | Tue 24 – Sat 28 | write-up (problem → method → Exp. 3 → diagnostic → robustness → adaptation → limits), figures, slides |
+| 12–13 | Sun 29 – Mon 30 | rehearsal, Q&A prep |
+| 14–15 | Tue 1 – Wed 2 Dec | buffer |
+
+### Dropped for time
+PANet head / fusion strategies A/B/D/D′, ESIA/PCSA adapters, Shannon-as-input arm, ISPRS Potsdam, LoveDA, 7-class split,
+NIR-gain retuning, new training lengths. The 12k-step models stay the headline of Exp. 3; robustness uses the 4k models
+(the NIR gain was identical at 4k and 12k).
+
+### Open, owned by teammates
+1. EU UAV data access (still the biggest risk; the simulated cameras are the fallback — say so in the paper).
+2. Literature check on NIR/channel robustness of SAM-type models (decides how strongly we claim novelty).
+3. Published FLAIR-HUB baselines (we train on 21 of 58 training domains — state it).
+4. ViRefSAM provenance question before the write-up; HRNet recap number.
+
+---
+
 ## RESULT 2026-10-28 — 12,000-step runs + NIR diagnostic (4,000-step models)
 
 - **12,000 steps** (`outputs/long/train` on the cluster; report copied to `outputs/long_report/` on the Mac): RGB
