@@ -28,7 +28,7 @@ import numpy as np  # noqa: E402
 import torch  # noqa: E402
 
 from datasets.flair import FLAIR_CLASSES  # noqa: E402
-from train.data import load_rgbi, load_split, test_subset  # noqa: E402
+from train.data import CHANNELS, load_rgbi, load_split, test_subset  # noqa: E402
 from train.metrics import K, confusion, iou_per_class, miou  # noqa: E402
 from train.sam3_rgbi import CLASSES, PATCH_EMBED, SAM3_MODEL_ID, normalise, predict_classes  # noqa: E402
 
@@ -93,11 +93,11 @@ def ablation(runs, a, rels, out_dir, dev):
     res = {}
     for name, d in sorted(runs.items()):
         cfg = json.load(open(os.path.join(d, "config.json")))
-        conds = CONDITIONS if cfg["channels"] == "rgbi" else ("normal",)
+        conds = CONDITIONS if CHANNELS[cfg["channels"]] == 4 else ("normal",)       # arms that see NIR at all
         todo = [c for c in conds if not os.path.exists(os.path.join(out_dir, f"abl_{name}_{c}.npy"))]
         if todo:
             net = load_net(d, cfg["model"], cfg["channels"], cfg["lora_rank"], False, dev)
-            n_ch = 4 if cfg["channels"] == "rgbi" else 3
+            n_ch = CHANNELS[cfg["channels"]]
             for c in todo:
                 conf = np.zeros((K, K), np.int64)
                 with torch.inference_mode():
@@ -178,20 +178,21 @@ def main():
     summary = {"weights": W, "loss": L}
     if A:
         lines += ["", f"## 3. NIR ablation (mIoU on {a.n_images} fixed test patches)", "",
-                  "| Seed | RGB-only model | RGB+NIR, real NIR | NIR flattened | NIR from another patch |",
+                  "| Run | RGB-only model (same seed) | real NIR | NIR flattened | NIR from another patch |",
                   "|---|---|---|---|---|"]
         abl = {}
-        for n in sorted(k for k in A if k.startswith("rgbi_")):
-            seed = n.split("_s")[1]
+        for n in sorted(k for k in A if k.startswith(("rgbi_", "rgb_ndvi_"))):
+            seed = n.rsplit("_s", 1)[1]
             rgb = A.get(f"rgb_s{seed}", {}).get("normal")
             row = {c: miou(A[n][c]) for c in CONDITIONS}
             row["rgb_only"] = miou(rgb) if rgb is not None else None
             abl[n] = row
-            lines.append(f"| {seed} | {row['rgb_only']:.4f} | {row['normal']:.4f} | {row['nir_flat']:.4f} | "
+            lines.append(f"| {n} | {row['rgb_only']:.4f} | {row['normal']:.4f} | {row['nir_flat']:.4f} | "
                          f"{row['nir_swap']:.4f} |" if row["rgb_only"] is not None else
-                         f"| {seed} | — | {row['normal']:.4f} | {row['nir_flat']:.4f} | {row['nir_swap']:.4f} |")
+                         f"| {n} | — | {row['normal']:.4f} | {row['nir_flat']:.4f} | {row['nir_swap']:.4f} |")
         # per class, pooled over seeds
-        pooled = {c: sum(A[n][c] for n in abl) for c in CONDITIONS}
+        raw = [n for n in abl if n.startswith("rgbi_s")]            # the plain RGB+NIR arm (not the NDVI-adapter arm)
+        pooled = {c: sum(A[n][c] for n in raw) for c in CONDITIONS}
         iou = {c: iou_per_class(pooled[c]) for c in CONDITIONS}
         lines += ["", "Per class (seeds pooled): IoU with real NIR, and the change when NIR is flattened / swapped.", "",
                   "| Class | real NIR | flattened Δ | swapped Δ |", "|---|---|---|---|"]

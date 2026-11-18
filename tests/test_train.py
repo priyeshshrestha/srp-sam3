@@ -113,6 +113,83 @@ def test_nir_weight_report():
     assert 0 < r["nir_over_mean_rgb"] < 1
 
 
+def test_ndvi_tinyseg_noop_and_trainable():
+    from train.sam3_rgbi import TinySeg, ndvi_from_normalised
+    torch.manual_seed(0)
+    plain, ndvi = TinySeg(4), TinySeg(4, ndvi=True)
+    ndvi.load_state_dict({**plain.state_dict(), **{k: v for k, v in ndvi.state_dict().items() if k.startswith("ndvi")}})
+    x = torch.rand(1, 4, 64, 64) * 2 - 1
+    idx = torch.tensor([[0, 5]])
+    assert torch.equal(plain(x, idx), ndvi(x, idx)), "zero-initialised NDVI branch must be a no-op"
+    raw = torch.tensor([0.5, 0.0, 0.0, 1.0]).view(1, 4, 1, 1)            # R=0.5, G=B=0, NIR=1.0 (in [0, 1])
+    nd = ndvi_from_normalised(raw * 2 - 1)
+    assert abs(float(nd) - (1.0 - 0.5) / (1.0 + 0.5)) < 1e-3, "NDVI of NIR=1, R=0.5 is 1/3"
+    with torch.no_grad():
+        ndvi.ndvi_conv.weight.normal_()
+    ndvi(x, idx).sum().backward()
+    assert ndvi.ndvi_conv.weight.grad.abs().sum() > 0
+
+
+def test_rgb_ndvi_reads_nir_only_through_the_adapter():
+    from train.sam3_rgbi import TinySeg
+    torch.manual_seed(0)
+    plain = TinySeg(3)                                           # the RGB model: 3-channel input
+    veg = TinySeg(3, ndvi=True, input_channels=4)               # VegSAM-style: 4-band input, ViT reads RGB only
+    veg.load_state_dict({**plain.state_dict(), **{k: v for k, v in veg.state_dict().items() if k.startswith("ndvi")}})
+    x = torch.rand(1, 4, 64, 64) * 2 - 1
+    idx = torch.tensor([[1, 4]])
+    assert torch.equal(veg(x, idx), plain(x[:, :3], idx)), "at init the NIR band changes nothing"
+    with torch.no_grad():
+        veg.ndvi_conv.weight.normal_()
+    changed = veg(x, idx)
+    x2 = x.clone(); x2[:, 3] = -x2[:, 3]
+    assert not torch.equal(changed, veg(x2, idx)), "after training the adapter makes NIR matter"
+    assert not torch.equal(veg(x, idx)[0], plain(x[:, :3], idx)[0])
+
+
+def test_focus_weights_and_schedule():
+    from train.data import focus_hash, focus_weights, sample_prompts
+    counts = {"a": {1: 900, 6: 100}, "b": {6: 800, 7: 200}, "c": {1: 1000}}
+    w = focus_weights(counts, ["a", "b", "c"], priority=[6, 7], floor=0.1)
+    assert abs(w["a"] - 0.2) < 1e-9 and abs(w["b"] - 1.1) < 1e-9 and abs(w["c"] - 0.1) < 1e-9
+    f = {"priority": [6, 7], "floor": 0.1, "split_sha": "x", "weights": w}
+    assert focus_hash(f) == focus_hash(dict(f)) and focus_hash({**f, "floor": 0.2}) != focus_hash(f)
+    # priority classes are prompted first
+    y = np.zeros((100, 100), np.int64)
+    y[:, :40], y[:, 40:70], y[:, 70:] = 1, 6, 3
+    rng = np.random.default_rng(0)
+    pr = [CLASSES.index(6)]
+    for _ in range(20):
+        cls = sample_prompts(y, 3, rng, pr)
+        assert CLASSES.index(6) in cls.tolist() and len(set(cls.tolist())) == 3
+
+
+def test_focused_schedule_is_paired_and_biased():
+    try:
+        import tifffile
+    except ImportError:
+        print("  (tifffile missing: skipped focused schedule test)")
+        return
+    from train.data import TrainSchedule
+    tmp = tempfile.mkdtemp()
+    rels, rng = [], np.random.default_rng(0)
+    for k in range(4):
+        d = os.path.join(tmp, "D001_2020", "aerial", "Z1"); m = os.path.join(tmp, "D001_2020", "labels", "Z1")
+        os.makedirs(d, exist_ok=True); os.makedirs(m, exist_ok=True)
+        tifffile.imwrite(os.path.join(d, f"IMG_{k}.tif"), rng.integers(0, 255, (5, 64, 64), dtype=np.uint8),
+                         planarconfig="separate", photometric="minisblack")
+        tifffile.imwrite(os.path.join(m, f"MSK_{k}.tif"), np.full((64, 64), 6 if k == 0 else 1, np.uint8))
+        rels.append(f"D001_2020/aerial/Z1/IMG_{k}.tif")
+    w = [1.0, 0.01, 0.01, 0.01]
+    a = TrainSchedule(tmp, rels, "rgb", "rgbi", seed=3, n_items=60, weights=w, priority_idx=[5])
+    b = TrainSchedule(tmp, rels, "rgb", "rgbi_ndvi", seed=3, n_items=60, weights=w, priority_idx=[5])
+    assert (a.order == b.order).all() and (a.order == 0).mean() > 0.8, "weighted draws favour patch 0"
+    for i in range(0, 60, 7):
+        assert torch.equal(a[i][0], b[i][0]) and torch.equal(a[i][1], b[i][1])
+    resumed = TrainSchedule(tmp, rels, "rgb", "rgbi", seed=3, n_items=60, start_item=30, weights=w, priority_idx=[5])
+    assert torch.equal(resumed[0][0], a[30][0]), "resume continues the same focused schedule"
+
+
 def test_prompt_sampling():
     y = np.zeros((100, 100), np.int64) + 6
     y[:, :30] = 1
@@ -213,6 +290,46 @@ def test_schedule_is_paired_across_channels():
             "RGB and RGBI runs must see the same image, augmentation and prompts"
     resumed = TrainSchedule(tmp, rels, "rgb", "rgbi", seed=3, n_items=10, start_item=6)
     assert torch.equal(resumed[0][0], b[6][0]), "resuming must continue the same schedule"
+
+
+def test_hub_patch_id_and_dates_roundtrip():
+    import sqlite3
+    from datasets.flair_rgb import hub_patch_id, read_aerial_dates
+    rel = "D069-2020_AERIAL_RGBI/AF-S1-35/D069-2020_AERIAL_RGBI_AF-S1-35_5-5.tif"
+    assert hub_patch_id(rel) == "D069-2020_AF-S1-35_5-5"
+    assert hub_patch_id("D001_2020/aerial/Z1_AA/IMG_001000.tif") is None
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "dates.gpkg")
+        con = sqlite3.connect(path)
+        con.execute("create table gpkg_contents (table_name text, data_type text)")
+        con.execute("insert into gpkg_contents values ('D069-2020_AERIAL_MTD_DATES', 'features')")
+        con.execute("create table 'D069-2020_AERIAL_MTD_DATES' (fid integer, patch_id text, date text, time text)")
+        con.execute("insert into 'D069-2020_AERIAL_MTD_DATES' values (1, 'D069-2020_AF-S1-35_5-5', '20200623', '09h')")
+        con.commit()
+        con.close()
+        assert read_aerial_dates(path) == {"D069-2020_AF-S1-35_5-5": "20200623"}
+
+
+def test_per_domain_table():
+    from scripts.train_report import _per_domain
+    from train.metrics import K
+    rng = np.random.default_rng(0)
+    rels = [f"D00{d}_2020/aerial/Z/IMG_{d}{i:03d}.tif" for d in (1, 2) for i in range(12)]
+    base = rng.integers(0, 50, (24, K, K)).astype(np.int64)
+    arm = base.copy()
+    arm[:12, np.arange(K), np.arange(K)] += 200                 # the arm is better on domain 1 only
+    dates = {r: "20200601" if "D001" in r else "20200901" for r in rels}
+    lines, res = [], {}
+    _per_domain(lines, res, "delta_x", base, arm, rels, dates, "A", "B", [], 50)
+    rows = {r["domain"]: r for r in res["delta_x_by_domain"]}
+    assert set(rows) == {"D001_2020", "D002_2020"} and rows["D001_2020"]["n_images"] == 12
+    assert rows["D001_2020"]["delta"] > 0.05 and abs(rows["D002_2020"]["delta"]) < 1e-9
+    assert rows["D001_2020"]["median_date"] == "20200601" and "ci95" in rows["D001_2020"]
+    assert "delta_x_by_domain_r_vs_day" not in res                # only 2 domains: no correlation claimed
+    assert any("Fewer than 5 dated domains" in l for l in lines) and any("D001_2020" in l for l in lines)
+    lines, res = [], {}
+    _per_domain(lines, res, "k", base[:5], arm[:5], rels[:5], {}, "A", "B", [], 50)
+    assert "ci95" not in res["k_by_domain"][0]                    # fewer than 10 images: no CI
 
 
 if __name__ == "__main__":

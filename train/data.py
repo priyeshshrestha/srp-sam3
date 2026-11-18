@@ -23,7 +23,18 @@ from datasets.flair import _read_tif, domain_of, mask_path_for
 from datasets.flair_rgb import BAND_ORDERS, read_label
 from train.sam3_rgbi import CLASSES
 
-CHANNELS = {"rgb": 3, "rgbi": 4}
+# CHANNELS: bands in the INPUT tensor. PATCH_CHANNELS: channels of the model's first (patch-embedding) layer.
+# rgb_ndvi (VegSAM-style) reads all 4 bands but the ViT sees only R,G,B; NIR reaches the model ONLY through
+# the NDVI adapter. rgbi_ndvi = raw NIR channel AND the adapter.
+CHANNELS = {"rgb": 3, "rgbi": 4, "rgbi_ndvi": 4, "rgb_ndvi": 4}
+PATCH_CHANNELS = {"rgb": 3, "rgbi": 4, "rgbi_ndvi": 4, "rgb_ndvi": 3}
+
+
+def uses_ndvi(channels: str) -> bool:
+    return channels.endswith("_ndvi")
+
+
+
 MIN_PRESENT_FRAC = 0.005          # a class "is present" for prompt sampling if it covers >= 0.5% of the patch
 
 
@@ -140,14 +151,20 @@ def to_model_input(x_uint8: np.ndarray, channels: str) -> torch.Tensor:
     return torch.from_numpy(np.ascontiguousarray(x_uint8[:CHANNELS[channels]]))
 
 
-def sample_prompts(label: np.ndarray, n_prompts: int, rng: np.random.Generator) -> np.ndarray:
+def sample_prompts(label: np.ndarray, n_prompts: int, rng: np.random.Generator,
+                   priority_idx=None) -> np.ndarray:
     """Class indices (0..11) to prompt: up to n_prompts-1 present classes, the rest absent ones, so
-    the model learns both 'segment it' and 'it is not here'. Falls back gracefully at the extremes."""
+    the model learns both 'segment it' and 'it is not here'. Falls back gracefully at the extremes.
+    With `priority_idx`, present PRIORITY classes are prompted before other present classes."""
     frac = np.array([(label == c).mean() for c in CLASSES])
     present = np.flatnonzero(frac >= MIN_PRESENT_FRAC)
     absent = np.flatnonzero(frac < MIN_PRESENT_FRAC)
     n_pos = min(len(present), max(1, n_prompts - 1)) if len(present) else 0
-    pos = rng.choice(present, n_pos, replace=False) if n_pos else np.array([], dtype=int)
+    if priority_idx is not None and n_pos:
+        is_p = np.isin(present, list(priority_idx))
+        pos = np.concatenate([rng.permutation(present[is_p]), rng.permutation(present[~is_p])])[:n_pos]
+    else:
+        pos = rng.choice(present, n_pos, replace=False) if n_pos else np.array([], dtype=int)
     n_neg = n_prompts - n_pos
     pool = absent if len(absent) >= n_neg else np.setdiff1d(np.arange(len(CLASSES)), pos)
     neg = rng.choice(pool, n_neg, replace=False)
@@ -163,16 +180,59 @@ def augment(x: np.ndarray, y: np.ndarray, rng: np.random.Generator):
     return np.ascontiguousarray(x), np.ascontiguousarray(y)
 
 
-class TrainSchedule(Dataset):
-    """Item k of the whole training run (k = step * batch + slot), deterministic in (seed, k)."""
+# ---------------------------------------------------------------------- focus on priority classes
+def focus_weights(counts: Dict[str, Dict[int, int]], rel_paths: Sequence[str], priority: Sequence[int],
+                  floor: float) -> Dict[str, float]:
+    """Sampling weight of a training patch = floor + (fraction of its pixels in the priority classes).
+    So a patch full of priority classes is drawn (1 + floor) / floor times as often as one with none."""
+    out = {}
+    for rel in rel_paths:
+        c = counts[rel]
+        total = max(1, sum(c.values()))
+        out[rel] = float(floor) + sum(c.get(int(k), 0) for k in priority) / total
+    return out
 
-    def __init__(self, root, rel_paths, band_order, channels, seed, n_items, n_prompts=3, start_item=0):
+
+def focus_hash(focus: Dict) -> str:
+    h = hashlib.sha256(json.dumps([sorted(focus["priority"]), focus["floor"], focus["split_sha"]]).encode())
+    for rel in sorted(focus["weights"]):
+        h.update(f"{rel}:{focus['weights'][rel]:.6f}".encode())
+    return h.hexdigest()[:16]
+
+
+def load_focus(path: str, split: Dict) -> Dict:
+    """Focus file -> dict with 'priority', 'floor', 'sha' and 'w' (weights aligned with split['train'])."""
+    with open(path) as fh:
+        focus = json.load(fh)
+    if focus_hash(focus) != focus.get("sha"):
+        raise ValueError(f"{path}: contents do not match its recorded sha (edited by hand?)")
+    if focus["split_sha"] != split["sha"]:
+        raise ValueError(f"{path} was made for split {focus['split_sha']}, not {split['sha']}")
+    focus["w"] = [focus["weights"][r] for r in split["train"]]
+    return focus
+
+
+class TrainSchedule(Dataset):
+    """Item k of the whole training run (k = step * batch + slot), deterministic in (seed, k).
+
+    With `weights` (one per patch, e.g. from focus_weights) patches are drawn WITH replacement in
+    proportion to their weight, and `priority_idx` classes are prompted first; otherwise every patch is
+    seen once per pass in a random order. Either way the schedule depends only on (seed, weights), never
+    on the model, so the arms of a comparison see identical data."""
+
+    def __init__(self, root, rel_paths, band_order, channels, seed, n_items, n_prompts=3, start_item=0,
+                 weights=None, priority_idx=None):
         self.root, self.rel, self.band_order, self.channels = root, list(rel_paths), band_order, channels
         self.seed, self.n_prompts, self.start = seed, n_prompts, start_item
         self.n_items = n_items
-        n_epochs = n_items // len(self.rel) + 1
+        self.priority_idx = None if priority_idx is None else [int(i) for i in priority_idx]
         g = np.random.default_rng([seed, 999_983])
-        self.order = np.concatenate([g.permutation(len(self.rel)) for _ in range(n_epochs)])
+        if weights is not None:
+            w = np.asarray(weights, dtype=np.float64)
+            self.order = g.choice(len(self.rel), size=n_items + 1, replace=True, p=w / w.sum())
+        else:
+            n_epochs = n_items // len(self.rel) + 1
+            self.order = np.concatenate([g.permutation(len(self.rel)) for _ in range(n_epochs)])
 
     def __len__(self):
         return self.n_items - self.start
@@ -182,7 +242,7 @@ class TrainSchedule(Dataset):
         rng = np.random.default_rng([self.seed, k])
         x, y = load_rgbi(self.root, self.rel[self.order[k]], self.band_order)
         x, y = augment(x, y, rng)
-        cls = sample_prompts(y, self.n_prompts, rng)
+        cls = sample_prompts(y, self.n_prompts, rng, self.priority_idx)
         target = np.stack([(y == CLASSES[c]) for c in cls]).astype(np.float32)
         valid = (y >= 1) & (y <= 19)
         return to_model_input(x, self.channels), torch.from_numpy(cls), torch.from_numpy(target), torch.from_numpy(valid)

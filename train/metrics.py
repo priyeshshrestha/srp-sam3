@@ -36,6 +36,15 @@ def miou(conf: np.ndarray) -> float:
     return float(np.nanmean(iou[present])) if present.any() else float("nan")
 
 
+def miou_subset(conf: np.ndarray, class_ids) -> float:
+    """Mean IoU over the given FLAIR class ids only (still counted over ALL evaluated pixels, so calling a road
+    'meadow' stays a mistake). Classes absent from the ground truth are skipped."""
+    idx = [int(c) - 1 for c in class_ids]
+    iou = iou_per_class(conf)[idx]
+    present = conf.sum(1)[idx] > 0
+    return float(np.nanmean(iou[present])) if present.any() else float("nan")
+
+
 def summary(conf: np.ndarray) -> Dict:
     iou = iou_per_class(conf)
     return {"miou": miou(conf), "pixel_acc": float(np.trace(conf) / max(1, conf.sum())),
@@ -49,7 +58,7 @@ def image_miou(conf_i: np.ndarray) -> float:
 
 
 def paired_bootstrap_delta(conf_a: np.ndarray, conf_b: np.ndarray, n_boot: int = 1000,
-                           seed: int = 0) -> Dict:
+                           seed: int = 0, subset=None) -> Dict:
     """mIoU(b) - mIoU(a) with a 95% CI, resampling TEST IMAGES (same resample for both).
 
     conf_a / conf_b: (N, K, K) per-image confusions of two models on the same N images. To pool
@@ -61,6 +70,7 @@ def paired_bootstrap_delta(conf_a: np.ndarray, conf_b: np.ndarray, n_boot: int =
     point = miou(conf_b.sum(0)) - miou(conf_a.sum(0))
     point_cls = iou_per_class(conf_b.sum(0)) - iou_per_class(conf_a.sum(0))
     deltas = np.empty(n_boot)
+    deltas_sub = np.empty(n_boot)
     deltas_cls = np.empty((n_boot, conf_a.shape[1]))
     for i in range(n_boot):
         idx = rng.integers(0, n, n)
@@ -68,6 +78,8 @@ def paired_bootstrap_delta(conf_a: np.ndarray, conf_b: np.ndarray, n_boot: int =
         a = np.tensordot(cnt, conf_a, axes=1)
         b = np.tensordot(cnt, conf_b, axes=1)
         deltas[i] = miou(b) - miou(a)
+        if subset:
+            deltas_sub[i] = miou_subset(b, subset) - miou_subset(a, subset)
         deltas_cls[i] = iou_per_class(b) - iou_per_class(a)
     lo, hi = np.percentile(deltas, [2.5, 97.5])
     with np.errstate(invalid="ignore"):
@@ -75,5 +87,11 @@ def paired_bootstrap_delta(conf_a: np.ndarray, conf_b: np.ndarray, n_boot: int =
     per_class = {int(c): {"delta": None if np.isnan(d) else float(d), "ci95": [float(l), float(h)],
                           "significant": bool(l > 0 or h < 0)}
                  for c, d, l, h in zip(CLASSES, point_cls, lo_c, hi_c)}
-    return {"delta": float(point), "ci95": [float(lo), float(hi)], "n_images": int(n), "n_boot": n_boot,
-            "significant": bool(lo > 0 or hi < 0), "per_class": per_class}
+    out = {"delta": float(point), "ci95": [float(lo), float(hi)], "n_images": int(n), "n_boot": n_boot,
+           "significant": bool(lo > 0 or hi < 0), "per_class": per_class}
+    if subset:
+        slo, shi = np.percentile(deltas_sub, [2.5, 97.5])
+        out["subset"] = {"classes": [int(c) for c in subset],
+                         "delta": float(miou_subset(conf_b.sum(0), subset) - miou_subset(conf_a.sum(0), subset)),
+                         "ci95": [float(slo), float(shi)], "significant": bool(slo > 0 or shi < 0)}
+    return out

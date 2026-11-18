@@ -17,6 +17,12 @@ What changes in SAM 3
     at test time all 12 prompts are run and the per-pixel argmax is the prediction.
   * The text encoder (353 M) is run once for the 12 phrases and then dropped from memory.
 
+  * Optional NDVI adapter (arms `rgb_ndvi` and `rgbi_ndvi`, after VegSAM, Wu, Li & Hong, CVPRW 2026): NDVI = (NIR - R) /
+    (NIR + R) is patch-embedded to the ViT's token grid, passed through a per-block MLP and a shared MLP
+    (zero-initialised, so again an exact no-op at step 0) and ADDED to the output of every ViT block.
+    rgb_ndvi (VegSAM-style): the ViT sees only R,G,B and NIR enters ONLY through the adapter. rgbi_ndvi keeps
+    the raw NIR channel as well, so rgbi_ndvi vs rgbi isolates what the NDVI prior adds on top of raw NIR.
+
 `TinySeg` has the same interface and exists ONLY so run_train.sh can be tested without weights.
 """
 
@@ -82,14 +88,48 @@ def widen_conv(conv: nn.Conv2d, in_channels: int) -> nn.Conv2d:
     return new.to(conv.weight.device, conv.weight.dtype)
 
 
+def ndvi_from_normalised(images: torch.Tensor) -> torch.Tensor:
+    """(B, >=4, H, W) SAM-normalised ([-1, 1]) R,G,B,NIR -> (B, 1, H, W) NDVI in [-1, 1]."""
+    x = images.float() * 0.5 + 0.5
+    red, nir = x[:, 0:1], x[:, 3:4]
+    return (nir - red) / (nir + red + 1e-4)
+
+
+class NdviAdapter(nn.Module):
+    """VegSAM-style vegetation prior: P_i = MLP_shared(GELU(MLP_i(PatchEmbed(NDVI)))) for ViT block i.
+    MLP_shared starts at zero, so the adapter is an exact no-op until trained."""
+
+    def __init__(self, hidden: int, n_layers: int, bottleneck: int = 64, patch: int = 14):
+        super().__init__()
+        self.embed = nn.Conv2d(1, hidden, patch, patch)
+        self.per_block = nn.ModuleList(nn.Linear(hidden, bottleneck) for _ in range(n_layers))
+        self.shared = nn.Linear(bottleneck, hidden)
+        self.act = nn.GELU()
+        nn.init.zeros_(self.shared.weight)
+        nn.init.zeros_(self.shared.bias)
+
+    def tokens(self, ndvi: torch.Tensor) -> torch.Tensor:
+        """(B, 1, H, W) -> (B, H/14, W/14, hidden), the layout of the ViT's hidden states."""
+        return self.embed(ndvi).permute(0, 2, 3, 1)
+
+    def forward(self, i: int, tokens: torch.Tensor) -> torch.Tensor:
+        return self.shared(self.act(self.per_block[i](tokens)))
+
+
 # --------------------------------------------------------------------------------- the models
 class Sam3Semantic(nn.Module):
     """forward(images (B, C, H, W) normalised, class_idx (B, P) in 0..11) -> logits (B, P, H, W)."""
 
     def __init__(self, in_channels: int = 3, lora_rank: int = 16, train_parts: bool = True,
-                 model_id: str = SAM3_MODEL_ID, seed: int = 0):
+                 model_id: str = SAM3_MODEL_ID, seed: int = 0, ndvi: bool = False,
+                 input_channels: int = None):
         super().__init__()
         from transformers import Sam3Model, Sam3Processor
+        input_channels = in_channels if input_channels is None else input_channels
+        if ndvi and input_channels < 4:
+            raise ValueError("the NDVI adapter needs the NIR band (input_channels >= 4)")
+        if input_channels < in_channels:
+            raise ValueError("input_channels must be >= in_channels")
         model = Sam3Model.from_pretrained(model_id)
         proc = Sam3Processor.from_pretrained(model_id)
 
@@ -123,8 +163,35 @@ class Sam3Semantic(nn.Module):
                             and not name.startswith(("mask_decoder.instance_projection", "mask_decoder.mask_embedder")))):
                     p.requires_grad_(True)
         self.model = model
-        self.in_channels = in_channels
+        self.in_channels = in_channels            # channels the ViT's patch embedding reads (the first ones)
+        self.input_channels = input_channels      # bands in the input tensor (NDVI needs R and NIR)
         self.hidden = model.config.detr_encoder_config.hidden_size
+        self.ndvi_adapter = None
+        self._ndvi_tokens = None
+        self._ckpt = False
+        if ndvi:
+            torch.manual_seed(seed + 1)               # adapter init is independent of everything above
+            self.ndvi_adapter = NdviAdapter(model.config.vision_config.backbone_config.hidden_size,
+                                            len(model.vision_encoder.backbone.layers))
+        self._install_layer_wrappers()
+
+    def _install_layer_wrappers(self):
+        """ViT layer i computes   out = layer_i(x)   [recomputed in backward when checkpointing]
+        and, with the NDVI adapter,   out = out + adapter(i, ndvi_tokens)   OUTSIDE the checkpoint."""
+        from torch.utils.checkpoint import checkpoint
+        for i, layer in enumerate(self.model.vision_encoder.backbone.layers):
+            if not hasattr(layer, "_orig_forward"):
+                layer._orig_forward = layer.forward
+
+            def fwd(x, *args, _l=layer, _i=i, **kw):
+                if self._ckpt and _l.training and torch.is_grad_enabled():
+                    out = checkpoint(_l._orig_forward, x, *args, use_reentrant=False, **kw)
+                else:
+                    out = _l._orig_forward(x, *args, **kw)
+                if self.ndvi_adapter is not None:
+                    out = out + self.ndvi_adapter(_i, self._ndvi_tokens).to(out.dtype)
+                return out
+            layer.forward = fwd
 
     def enable_checkpointing(self):
         """Recompute each ViT and DETR-encoder layer in the backward pass instead of storing its
@@ -133,8 +200,8 @@ class Sam3Semantic(nn.Module):
         72x72 = 5184 tokens per prompt; without checkpointing, a kernel that materialises the
         attention matrix stores ~0.4 GB per layer per prompt (out of memory on a 20 GB Mac)."""
         from torch.utils.checkpoint import checkpoint
-        layers = list(self.model.vision_encoder.backbone.layers) + list(self.model.detr_encoder.layers)
-        for layer in layers:
+        self._ckpt = True                              # ViT layers: handled by _install_layer_wrappers
+        for layer in list(self.model.detr_encoder.layers):
             def wrapped(*args, _f=layer.forward, _layer=layer, **kw):
                 if _layer.training and torch.is_grad_enabled():
                     return checkpoint(_f, *args, use_reentrant=False, **kw)
@@ -148,7 +215,9 @@ class Sam3Semantic(nn.Module):
         """The image part (ViT + FPN), computed once per image whatever the number of prompts."""
         if images.shape[-1] != SAM3_SIZE or images.shape[-2] != SAM3_SIZE:
             images = F.interpolate(images, size=(SAM3_SIZE, SAM3_SIZE), mode="bilinear", align_corners=False)
-        vis = self.model.vision_encoder(images)
+        if self.ndvi_adapter is not None:
+            self._ndvi_tokens = self.ndvi_adapter.tokens(ndvi_from_normalised(images))
+        vis = self.model.vision_encoder(images[:, :self.in_channels])
         return list(vis.fpn_hidden_states[:-1]), list(vis.fpn_position_encoding[:-1])
 
     def decode(self, enc_img, class_idx: torch.Tensor) -> torch.Tensor:
@@ -175,9 +244,15 @@ class Sam3Semantic(nn.Module):
 class TinySeg(nn.Module):
     """Pipeline stand-in (NOT a model to report): conv features + a learned embedding per class."""
 
-    def __init__(self, in_channels: int = 3, **_):
+    def __init__(self, in_channels: int = 3, ndvi: bool = False, input_channels: int = None, **_):
         super().__init__()
         self.in_channels = in_channels
+        self.input_channels = in_channels if input_channels is None else input_channels
+        self.ndvi_conv = None
+        if ndvi:
+            self.ndvi_conv = nn.Conv2d(1, 16, 3, padding=1)
+            nn.init.zeros_(self.ndvi_conv.weight)
+            nn.init.zeros_(self.ndvi_conv.bias)
         self.body = nn.Sequential(nn.Conv2d(in_channels, 16, 3, padding=1), nn.ReLU(),
                                   nn.Conv2d(16, 16, 3, padding=1), nn.ReLU())
         self.cls = nn.Embedding(len(CLASSES), 16)
@@ -191,18 +266,23 @@ class TinySeg(nn.Module):
         return self.decode(self.encode(images), class_idx)
 
     def encode(self, images):
-        return self.body(F.avg_pool2d(images, 4))                                 # (B, 16, h, w)
+        f = self.body(F.avg_pool2d(images[:, :self.in_channels], 4))              # (B, 16, h, w)
+        if self.ndvi_conv is not None:
+            f = f + self.ndvi_conv(F.avg_pool2d(ndvi_from_normalised(images), 4))
+        return f
 
     def decode(self, f, class_idx):
         return torch.einsum("bchw,bpc->bphw", f, self.cls(class_idx))
 
 
-def build(model: str, in_channels: int, lora_rank: int = 16, seed: int = 0) -> nn.Module:
+def build(model: str, in_channels: int, lora_rank: int = 16, seed: int = 0, ndvi: bool = False,
+          input_channels: int = None) -> nn.Module:
     if model == "sam3":
-        return Sam3Semantic(in_channels=in_channels, lora_rank=lora_rank, seed=seed)
+        return Sam3Semantic(in_channels=in_channels, lora_rank=lora_rank, seed=seed, ndvi=ndvi,
+                            input_channels=input_channels)
     if model == "tiny":
         torch.manual_seed(seed)
-        return TinySeg(in_channels=in_channels)
+        return TinySeg(in_channels=in_channels, ndvi=ndvi, input_channels=input_channels)
     raise ValueError(f"unknown model {model!r} (sam3 | tiny)")
 
 

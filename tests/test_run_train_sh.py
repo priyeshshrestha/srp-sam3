@@ -29,6 +29,7 @@ def run(tmp, mode=None, **extra):
     env = {**env, "PYTHON": sys.executable, "FLAIR_DATA_DIR": os.path.join(tmp, "data"),
            "OUT": os.path.join(tmp, "out"), "MODEL": "tiny", "DEVICE": "cpu", "GPUS": "cpu",
            "SEEDS": "0 1", "STEPS": "4", "BATCH": "2", "ACCUM": "1", "WORKERS": "0",
+           "ARMS": "rgb rgb_ndvi rgbi rgbi_ndvi", "PRIORITY": "5 7",
            "SKIP_TESTS": "1", "CUDA_VISIBLE_DEVICES": "", **extra}
     return subprocess.run(["bash", "run_train.sh"] + ([mode] if mode else []), cwd=ROOT, env=env,
                           capture_output=True, text=True)
@@ -44,15 +45,24 @@ def main():
         assert r.returncode == 0, f"exit {r.returncode}\n{r.stdout[-4000:]}\n{r.stderr[-1500:]}"
         assert "BAND_ORDER=rgb" in r.stdout
         assert "pipeline stand-in" in r.stdout
-        for tag in ("rgb_s0", "rgbi_s0", "rgb_s1", "rgbi_s1", "zeroshot_rgb"):
+        assert os.path.exists(os.path.join(out, "focus.json")), "focus file written"
+        for tag in ("rgb_s0", "rgb_ndvi_s0", "rgbi_s0", "rgbi_ndvi_s0", "rgb_s1", "rgb_ndvi_s1", "rgbi_s1", "rgbi_ndvi_s1",
+                    "zeroshot_rgb"):
             assert os.path.exists(os.path.join(out, "runs", tag, "DONE")), tag
         cfg0 = json.load(open(os.path.join(out, "runs", "rgb_s0", "config.json")))
         cfg1 = json.load(open(os.path.join(out, "runs", "rgbi_s0", "config.json")))
         assert {k for k in cfg0 if cfg0[k] != cfg1[k]} == {"channels"}, "RGB and RGBI must differ only in channels"
+        cfg2 = json.load(open(os.path.join(out, "runs", "rgbi_ndvi_s0", "config.json")))
+        assert {k for k in cfg1 if cfg1[k] != cfg2[k]} == {"channels"}, "the NDVI arm differs from RGBI only by arm"
+        assert cfg0["focus_priority"] == [5, 7] and cfg0["focus_sha"] == cfg2["focus_sha"] != ""
         summ = open(os.path.join(out, "report", "summary.md")).read()
         assert "RGB+NIR" in summ and "95% CI" in summ and "NOT results" in summ, summ
         res = json.load(open(os.path.join(out, "report", "summary.json")))
         assert res["seeds_paired"] == [0, 1] and "delta_rgbi_minus_rgb" in res
+        assert {"delta_ndvi_minus_rgbi", "delta_rgbndvi_minus_rgb", "delta_rgbndvi_minus_rgbi"} <= set(res), res.keys()
+        assert "subset" in res["delta_rgbi_minus_rgb"]
+        assert "NDVI adapter" in summ and "priority classes" in summ
+        assert "Per test domain" in summ and "delta_rgbi_minus_rgb_by_domain" in res, "per-domain table"
         figs = [f for f in os.listdir(os.path.join(out, "report", "figures")) if f.endswith(".png")]
         n_test = res["n_test"]
         assert len(figs) == min(10, n_test), (figs, n_test)
@@ -73,7 +83,8 @@ def main():
         assert d.returncode == 0, d.stdout[-2000:] + d.stderr[-2000:]
         assert "NIR ablation" in d.stdout
         diag = json.load(open(os.path.join(out, "diagnostic", "nir_diagnostic.json")))
-        assert set(diag["ablation"]) == {"rgbi_s0", "rgbi_s1"} and "nir_swap" in diag["ablation"]["rgbi_s0"]
+        assert set(diag["ablation"]) == {"rgbi_s0", "rgbi_s1", "rgbi_ndvi_s0", "rgbi_ndvi_s1", "rgb_ndvi_s0", "rgb_ndvi_s1"}
+        assert "nir_swap" in diag["ablation"]["rgbi_ndvi_s0"]
         assert diag["loss"]["rgb_s0"]["steps"] == 4
 
         print("[run_train.sh] re-run resumes (nothing retrained)...")

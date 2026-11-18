@@ -13,6 +13,7 @@ They are re-predicted from the saved checkpoints, so this step needs the GPU and
 """
 import argparse
 import csv
+import datetime
 import json
 import os
 import sys
@@ -21,8 +22,9 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 import numpy as np  # noqa: E402
 
-from datasets.flair import FLAIR_CLASSES  # noqa: E402
-from train.metrics import iou_per_class, miou, paired_bootstrap_delta, summary  # noqa: E402
+from datasets.flair import FLAIR_CLASSES, domain_of  # noqa: E402
+from train.data import CHANNELS  # noqa: E402
+from train.metrics import iou_per_class, miou, miou_subset, paired_bootstrap_delta, summary  # noqa: E402
 from train.sam3_rgbi import CLASSES  # noqa: E402
 
 # Official FLAIR-HUB label colours (github.com/IGNF/FLAIR-HUB README), keyed by FLAIR #1 id.
@@ -62,7 +64,8 @@ def training_setup(split_path, runs):
         cfg_p = os.path.join(r["dir"], "config.json")
         if not r["meta"]["zero_shot"] and os.path.exists(cfg_p):
             cfg = json.load(open(cfg_p))
-            out.update({k: cfg.get(k) for k in ("steps", "effective_batch", "lr", "prompts", "lora_rank", "model")})
+            out.update({k: cfg.get(k) for k in ("steps", "effective_batch", "lr", "prompts", "lora_rank", "model",
+                                                 "focus_priority", "focus_floor")})
             break
     return out
 
@@ -107,8 +110,10 @@ def main():
     ap.add_argument("--n_figures", type=int, default=10)
     ap.add_argument("--n_boot", type=int, default=1000)
     ap.add_argument("--device", default="auto")
+    ap.add_argument("--dates", help="patch_dates.json from scripts/season_check.py: adds the acquisition date to the per-domain tables")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
+    dates = json.load(open(a.dates)) if a.dates and os.path.exists(a.dates) else {}
 
     runs = []
     for d in a.runs:
@@ -129,8 +134,10 @@ def main():
 
     zs = [r for r in runs if r["meta"]["zero_shot"]]
     by = {ch: {r["meta"]["seed"]: r for r in runs if not r["meta"]["zero_shot"] and r["meta"]["channels"] == ch}
-          for ch in ("rgb", "rgbi")}
+          for ch in ("rgb", "rgbi", "rgbi_ndvi", "rgb_ndvi")}
     seeds = sorted(set(by["rgb"]) & set(by["rgbi"]))
+    setup = training_setup(a.split, runs)
+    prio = setup.get("focus_priority") or []            # classes the training focused on (empty = no focus)
 
     def cond_stats(rs):
         ms = [miou(r["conf"].sum(0)) for r in rs]
@@ -143,30 +150,91 @@ def main():
     lines += [f"Test set: {len(ref)} patches from held-out domains (split sha `{runs[0]['split_sha']}`). "
               f"mIoU over FLAIR classes 1-12 (pixels of classes 13-19 ignored), confusion accumulated over "
               f"all test images. Prediction = argmax over the 12 class prompts.", "",
-              "| Model | Training | Seeds | mIoU (mean ± sd over seeds) | per seed |", "|---|---|---|---|---|"]
+              "| Model | Training | Seeds | mIoU, 12 classes (mean ± sd over seeds) | per seed |"
+              + (" mIoU, priority classes |" if prio else ""),
+              "|---|---|---|---|---|" + ("---|" if prio else "")]
+    if prio:
+        lines.insert(len(lines) - 2, f"Training focused on FLAIR classes {', '.join(FLAIR_CLASSES[c] for c in prio)} "
+                                     f"(more patches rich in them, those classes prompted first); the test set is the "
+                                     f"complete official one. \"priority classes\" = mean IoU over exactly these.\n")
     for r in zs:
-        lines.append(f"| SAM 3 zero-shot ({r['meta']['channels']}) | none | - | {miou(r['conf'].sum(0)):.4f} | - |")
-    for ch, label in (("rgb", "RGB"), ("rgbi", "RGB+NIR")):
+        lines.append(f"| SAM 3 zero-shot ({r['meta']['channels']}) | none | - | {miou(r['conf'].sum(0)):.4f} | - |"
+                     + (f" {miou_subset(r['conf'].sum(0), prio):.4f} |" if prio else ""))
+    for ch, label in (("rgb", "RGB"), ("rgb_ndvi", "RGB + NDVI adapter (VegSAM-style, NIR only via adapter)"),
+                      ("rgbi", "RGB+NIR"), ("rgbi_ndvi", "RGB+NIR+NDVI adapter")):
         rs = [by[ch][s] for s in sorted(by[ch])]
         mean, sd, ms = cond_stats(rs)
         if rs:
             lines.append(f"| SAM 3 + LoRA, {label} | fine-tuned | {len(rs)} | **{mean:.4f}** ± {sd:.4f} | "
-                         f"{', '.join(f'{m:.4f}' for m in ms)} |")
+                         f"{', '.join(f'{m:.4f}' for m in ms)} |"
+                         + (f" **{np.mean([miou_subset(r['conf'].sum(0), prio) for r in rs]):.4f}** |" if prio else ""))
     res = {"n_test": len(ref), "split_sha": runs[0]["split_sha"], "seeds_paired": seeds,
-           "runs": {r["name"]: summary(r["conf"].sum(0)) for r in runs}, "setup": training_setup(a.split, runs)}
+           "runs": {r["name"]: summary(r["conf"].sum(0)) for r in runs}, "setup": setup}
+    if prio:
+        for r in runs:
+            res["runs"][r["name"]]["miou_priority"] = miou_subset(r["conf"].sum(0), prio)
 
     if seeds:
         a_conf = sum(by["rgb"][s]["conf"] for s in seeds)
         b_conf = sum(by["rgbi"][s]["conf"] for s in seeds)
-        bs = paired_bootstrap_delta(a_conf, b_conf, n_boot=a.n_boot)
+        bs = paired_bootstrap_delta(a_conf, b_conf, n_boot=a.n_boot, subset=prio or None)
         per_seed = [miou(by["rgbi"][s]["conf"].sum(0)) - miou(by["rgb"][s]["conf"].sum(0)) for s in seeds]
         res["delta_rgbi_minus_rgb"] = {**bs, "per_seed": per_seed}
         lines += ["", "## Does NIR help? (paired: same seeds, same test images)", "",
                   f"**mIoU(RGB+NIR) − mIoU(RGB) = {bs['delta']:+.4f}**, 95% CI [{bs['ci95'][0]:+.4f}, {bs['ci95'][1]:+.4f}] "
                   f"({'significant' if bs['significant'] else 'NOT significant'}; bootstrap over {bs['n_images']} test "
                   f"images, {len(seeds)} seed(s) pooled). Per seed: {', '.join(f'{d:+.4f}' for d in per_seed)}.", ""]
+        if prio and "subset" in bs:
+            ss = bs["subset"]
+            lines.append(f"On the **priority classes** only: **{ss['delta']:+.4f}**, 95% CI [{ss['ci95'][0]:+.4f}, "
+                         f"{ss['ci95'][1]:+.4f}] ({'significant' if ss['significant'] else 'NOT significant'}).")
         if len(seeds) < 3:
             lines.append("_Fewer than 3 paired seeds: the seed-to-seed spread is not yet known._")
+        extra_runs = []                                   # (panel name, run) for the figures
+        pair_done = [("rgb", "rgbi", seeds, "RGB", "RGB+NIR", "delta_rgbi_minus_rgb")]
+        PAIRS = [("rgbi", "rgbi_ndvi", "Does the NDVI adapter help on top of raw NIR? (paired)", "delta_ndvi_minus_rgbi",
+                  "RGB+NIR", "+NDVI adapter"),
+                 ("rgb", "rgb_ndvi", "Does NIR through the NDVI adapter ALONE help? (VegSAM-style: RGB input, NIR only via the adapter; paired)",
+                  "delta_rgbndvi_minus_rgb", "RGB", "RGB+NDVI adapter"),
+                 ("rgbi", "rgb_ndvi", "NIR as an input channel vs NIR only through the NDVI adapter (paired)",
+                  "delta_rgbndvi_minus_rgbi", "RGB+NIR", "RGB+NDVI adapter")]
+        names = {"rgbi_ndvi": "RGB+NIR+NDVI adapter", "rgb_ndvi": "RGB + NDVI adapter (VegSAM-style)"}
+        for base, arm, title, key, lb, la in PAIRS:
+            sp = sorted(set(by[base]) & set(by[arm]))
+            if not sp:
+                continue
+            b_conf = sum(by[arm][x]["conf"] for x in sp)
+            a_conf2 = sum(by[base][x]["conf"] for x in sp)
+            bn = paired_bootstrap_delta(a_conf2, b_conf, n_boot=a.n_boot, subset=prio or None)
+            res[key] = {**bn, "seeds": sp}
+            pair_done.append((base, arm, sp, lb, la, key))
+            if key == "delta_ndvi_minus_rgbi":
+                res["delta_ndvi_minus_rgbi"]["seeds"] = sp
+            lines += ["", f"## {title}", "",
+                      f"**mIoU({names.get(arm, arm)}) − mIoU({lb}) = {bn['delta']:+.4f}**, 95% CI [{bn['ci95'][0]:+.4f}, "
+                      f"{bn['ci95'][1]:+.4f}] ({'significant' if bn['significant'] else 'NOT significant'}; {len(sp)} seed(s) pooled)."]
+            if prio and "subset" in bn:
+                ss = bn["subset"]
+                lines.append(f"Priority classes only: **{ss['delta']:+.4f}**, 95% CI [{ss['ci95'][0]:+.4f}, {ss['ci95'][1]:+.4f}] "
+                             f"({'significant' if ss['significant'] else 'NOT significant'}).")
+            if base != "rgbi" or arm != "rgb_ndvi":
+                lines += ["", f"| Class | {lb} | {la} | Δ | 95% CI of Δ |", "|---|---|---|---|---|"]
+                iou_b = np.nanmean([iou_per_class(by[base][x]["conf"].sum(0)) for x in sp], axis=0)
+                iou_a = np.nanmean([iou_per_class(by[arm][x]["conf"].sum(0)) for x in sp], axis=0)
+                for j, c in enumerate(CLASSES):
+                    pc = bn["per_class"][int(c)]
+                    d = pc["delta"] if pc["delta"] is not None else float("nan")
+                    lines.append(f"| {FLAIR_CLASSES[c]} | {iou_b[j]:.3f} | {iou_a[j]:.3f} | {d:+.3f}{' *' if pc['significant'] else ''} | "
+                                 f"[{pc['ci95'][0]:+.3f}, {pc['ci95'][1]:+.3f}] |")
+            if seeds and arm not in [n for n, _ in extra_runs]:
+                extra_runs.append((arm, by[arm][sp[0]]))
+        extra_runs = [(names[arm], run) for arm, run in extra_runs]
+        lines += ["", "## Per test domain (does the difference depend on where and when the images were taken?)", "",
+                  "Descriptive: each test domain is one department and year (one acquisition campaign). Domains with fewer "
+                  f"than {MIN_DOMAIN_IMAGES} test images get no CI. Not corrected for multiple comparisons."]
+        for base, arm, sp, lb, la, key in pair_done:
+            _per_domain(lines, res, key, sum(by[base][x]["conf"] for x in sp), sum(by[arm][x]["conf"] for x in sp),
+                        ref, dates, lb, la, prio, a.n_boot)
 
         # Per-class
         iou = {k: np.nanmean([iou_per_class(by[k][s]["conf"].sum(0)) for s in seeds], axis=0) for k in ("rgb", "rgbi")}
@@ -195,7 +263,8 @@ def main():
             w.writerows(rows)
         _per_class_chart(rows, os.path.join(a.out, "per_class_iou.png"))
         if a.n_figures:
-            _figures(a, by["rgb"][seeds[0]], by["rgbi"][seeds[0]], zs[0] if zs else None, ref, lines)
+            _figures(a, by["rgb"][seeds[0]], by["rgbi"][seeds[0]], zs[0] if zs else None, ref, lines,
+                     extra=extra_runs)
     else:
         lines += ["", "_No seed has both an RGB and an RGB+NIR run finished: no paired comparison yet._"]
 
@@ -204,6 +273,47 @@ def main():
     with open(os.path.join(a.out, "summary.json"), "w") as fh:
         json.dump(res, fh, indent=1)
     print("\n".join(lines))
+
+
+MIN_DOMAIN_IMAGES = 10
+
+
+def _doy(date):
+    return datetime.datetime.strptime(date, "%Y%m%d").timetuple().tm_yday
+
+
+def _per_domain(lines, res, key, conf_base, conf_arm, rels, dates, lb, la, prio, n_boot):
+    """Per held-out domain: mIoU of both models, their paired difference with a CI, and (if known) the acquisition date."""
+    dom = np.array([domain_of(r) for r in rels])
+    rows = []
+    for d in sorted(set(dom)):
+        idx = np.where(dom == d)[0]
+        ds = sorted(dates[rels[i]] for i in idx if rels[i] in dates)
+        row = {"domain": d, "n_images": int(len(idx)), "median_date": ds[len(ds) // 2] if ds else None,
+               "miou_base": miou(conf_base[idx].sum(0)), "miou_arm": miou(conf_arm[idx].sum(0))}
+        row["delta"] = row["miou_arm"] - row["miou_base"]
+        if len(idx) >= MIN_DOMAIN_IMAGES:
+            bn = paired_bootstrap_delta(conf_base[idx], conf_arm[idx], n_boot=min(n_boot, 300), subset=prio or None)
+            row["ci95"] = bn["ci95"]
+            if prio and "subset" in bn:
+                row["delta_priority"] = bn["subset"]["delta"]
+        rows.append(row)
+    res[key + "_by_domain"] = rows
+    lines += ["", f"### {la} − {lb}", "", "| Domain | median date | images | " + f"{lb} | {la} | Δ | 95% CI of Δ |" +
+              (" Δ priority classes |" if prio else ""), "|---|---|---|---|---|---|---|" + ("---|" if prio else "")]
+    for r in rows:
+        ci = f"[{r['ci95'][0]:+.3f}, {r['ci95'][1]:+.3f}]" if "ci95" in r else "-"
+        lines.append(f"| {r['domain']} | {r['median_date'] or '-'} | {r['n_images']} | {r['miou_base']:.3f} | {r['miou_arm']:.3f} | "
+                     f"{r['delta']:+.3f} | {ci} |" + (f" {r['delta_priority']:+.3f} |" if prio and "delta_priority" in r else
+                                                      (" - |" if prio else "")))
+    dated = [r for r in rows if r["median_date"] and r["n_images"] >= MIN_DOMAIN_IMAGES]
+    if len(dated) >= 5 and np.std([_doy(r["median_date"]) for r in dated]) > 0 and np.std([r["delta"] for r in dated]) > 0:
+        r_ = float(np.corrcoef([_doy(r["median_date"]) for r in dated], [r["delta"] for r in dated])[0, 1])
+        res[key + "_by_domain_r_vs_day"] = r_
+        lines += ["", f"Correlation of Δ with acquisition day of year over {len(dated)} domains: r = {r_:+.2f} "
+                      "(season, year, camera and region are mixed; read as description, not cause)."]
+    elif dates:
+        lines += ["", "_Fewer than 5 dated domains with enough images: no correlation with the acquisition date._"]
 
 
 def _per_class_chart(rows, path):
@@ -228,7 +338,7 @@ def _per_class_chart(rows, path):
     plt.close(fig)
 
 
-def _figures(a, run_rgb, run_rgbi, run_zs, rels, lines):
+def _figures(a, run_rgb, run_rgbi, run_zs, rels, lines, extra=None):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -245,12 +355,13 @@ def _figures(a, run_rgb, run_rgbi, run_zs, rels, lines):
     dev = pick_device(a.device)
     panels = ([("SAM 3 zero-shot", run_zs)] if run_zs else []) + [("fine-tuned RGB", run_rgb),
                                                                  ("fine-tuned RGB+NIR", run_rgbi)]
+    panels += list(extra or [])
     data = [load_rgbi(a.root, rels[i], a.band_order) for i, _ in picks]
     preds = {}
     for name, run in panels:
         m = run["meta"]
         net = load_net(None if m["zero_shot"] else run["dir"], m["model"], m["channels"], 16, m["zero_shot"], dev)
-        n_ch = 4 if m["channels"] == "rgbi" else 3
+        n_ch = CHANNELS[m["channels"]]
         with torch.inference_mode():
             for (i, _), (x, y) in zip(picks, data):
                 xt = normalise(torch.from_numpy(x[:n_ch]).unsqueeze(0).to(dev))

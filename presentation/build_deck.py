@@ -1077,7 +1077,7 @@ def build(res: Results, figdir: str, out: str, tr: "TrainResults" = None):
             "Adapts SAM to multispectral urban-tree segmentation.",
             "NDVI prior injected through a lightweight adapter inside the image encoder; LoRA for parameter-efficient tuning.",
             "Prompt-free decoder fusing four multi-scale feature maps.",
-            "Reported: +1.13 / +1.04 IoU over its baseline on Potsdam / Vaihingen."], size=9.5, bullets=True, spacing=3)
+            "Reported: +1.13 / +1.04 IoU over the best competing method (Potsdam / Vaihingen, tree class only)."], size=9.5, bullets=True, spacing=3)
         box(s, 4.3, 1.2, 1.2, 0.55, "RGB", size=9.5)
         box(s, 4.3, 2.75, 1.2, 0.62, "NIR + red", sub="→ NDVI", size=9.5)
         box(s, 5.85, 1.1, 1.75, 1.15, "SAM 3 encoder ❄", sub="+ LoRA (trainable)", size=9.5)

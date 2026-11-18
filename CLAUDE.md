@@ -22,7 +22,9 @@ bash run_train.sh check          # training experiment: preflight only   (also: 
 bash run_train.sh                # probe memory -> queue runs onto free GPUs -> evaluate -> report  (run in tmux)
 bash run_train.sh status         # what is running / waiting / done
 bash run_train.sh diagnose       # does the RGB+NIR model use NIR? filter sizes, loss curves, NIR ablation (1 GPU)
+python scripts/season_check.py --split $T/split.json --fetch_to ~/flair_mtd --out $T/season [--ndvi --root $FLAIR_DATA_DIR --band_order rgb]   # acquisition dates (+ NDVI per class/domain); the report then adds dates per domain
 MAX_GPUS=2 bash run_train.sh     # cap: at most 2 of our runs at once, on the most-free GPUs (live: echo n > <T>/max_gpus)
+# arms + data focus:  ARMS="rgb rgb_ndvi rgbi rgbi_ndvi" PRIORITY="5 6 7 8 10" STEPS=2000 TEST_LIMIT=2000 OUT=./outputs/fast bash run_train.sh
 python tests/test_train.py; python tests/test_gpu_queue.py; python tests/test_run_train_sh.py
 ```
 
@@ -56,6 +58,12 @@ data-free and GPU-free** — a test needing a download is a test nobody runs. `r
   prompts (`rng([seed, item])` in `train/data.py`) and same LoRA init; NIR filters start at zero (= exactly
   pretrained SAM 3). Test domains are held out whole. `run_train.sh` refuses runs made with other settings.
   Report the paired RGBI - RGB difference with its CI and the zero-shot reference, never one arm alone.
+- **NDVI-adapter arms** (an adapter added after every ViT block, zero-initialised = exact no-op at step 0, verified on
+  the real weights): **`rgb_ndvi` = VegSAM-style: the ViT sees RGB only, NIR enters ONLY through the adapter**;
+  `rgbi_ndvi` = raw NIR channel AND the adapter. With `rgb` and `rgbi` this is a 2x2 (NIR as channel yes/no x adapter
+  yes/no). Only the NDVI adapter is taken from VegSAM (not its resizing modulator, tree token or decoder). **`PRIORITY` focuses only the TRAINING data** (patch weights from `scripts/make_focus.py`; the test
+  set stays the complete official one); the focus sha is part of each run's settings, so focused and unfocused runs
+  are never mixed. Report both mIoU(12 classes) and mIoU(priority classes).
 - **The cluster GPUs are shared with other students.** Never assume a free GPU; `scripts/gpu_queue.py` starts
   runs only where free memory fits, and every run must stay resumable (exit 3 = out of memory = re-queue).
 - **`mock` / `tiny` are not models.** It exists to test the pipeline; runs are tagged `is_measurement: false` and
@@ -81,7 +89,7 @@ data-free and GPU-free** — a test needing a download is a test nobody runs. `r
 | `run_train.sh` | Training experiment: preflight, memory probe, GPU queue, train + eval per run, report |
 | `train/sam3_rgbi.py` | SAM 3 with widened (zero-init NIR) patch embedding, LoRA, semantic head; `TinySeg` stand-in |
 | `train/data.py`, `train/metrics.py` | RGBI loading, held-out-domain split, paired training schedule; mIoU, paired bootstrap |
-| `scripts/train_sam3.py`, `eval_sam3.py`, `train_report.py`, `gpu_queue.py`, `make_split.py` | Training-experiment stages |
+| `scripts/train_sam3.py`, `eval_sam3.py`, `train_report.py`, `gpu_queue.py`, `make_split.py` | Training-experiment stages; `season_check.py` (acquisition dates, NDVI vs season) |
 | `presentation/build_deck.py` | Builds the final deck (template of the previous presentation) **only from real runs**; `render_keynote.sh` exports .key/.pdf/PNGs |
 | `datasets/flair.py`, `ecological/` | Legacy composite/NDVI/Shannon code. Only `_read_tif`, `mask_path_for`, `domain_of`, `FLAIR_CLASSES` are used. |
 

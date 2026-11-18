@@ -20,7 +20,7 @@ import torch  # noqa: E402
 from torch.utils.data import DataLoader  # noqa: E402
 
 from scripts.train_sam3 import pick_device  # noqa: E402
-from train.data import CHANNELS, TestSet, load_split, test_subset  # noqa: E402
+from train.data import CHANNELS, PATCH_CHANNELS, TestSet, load_split, test_subset, uses_ndvi  # noqa: E402
 from train.metrics import K, confusion, summary  # noqa: E402
 from train.sam3_rgbi import build, load_trainable, normalise, predict_classes  # noqa: E402
 
@@ -28,14 +28,15 @@ from train.sam3_rgbi import build, load_trainable, normalise, predict_classes  #
 def load_net(run_dir, model, channels, lora_rank, zero_shot, device):
     """The model of a finished run (or untrained SAM 3) on `device`, in eval mode."""
     if zero_shot:
-        net = build(model, CHANNELS[channels], lora_rank)
+        net = build(model, PATCH_CHANNELS[channels], lora_rank, input_channels=CHANNELS[channels])
     else:
         with open(os.path.join(run_dir, "config.json")) as fh:
             cfg = json.load(fh)
         final = os.path.join(run_dir, "final.pt")
         if not os.path.exists(final):
             raise FileNotFoundError(f"{final} missing: training of {run_dir} did not finish")
-        net = build(cfg["model"], CHANNELS[cfg["channels"]], cfg["lora_rank"], seed=cfg["seed"])
+        net = build(cfg["model"], PATCH_CHANNELS[cfg["channels"]], cfg["lora_rank"], seed=cfg["seed"],
+                    ndvi=uses_ndvi(cfg["channels"]), input_channels=CHANNELS[cfg["channels"]])
         load_trainable(net, torch.load(final, map_location="cpu")["trainable"])
     return net.to(device).eval()
 

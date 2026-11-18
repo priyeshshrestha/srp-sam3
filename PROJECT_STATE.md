@@ -1,5 +1,33 @@
 # PROJECT STATE — full handoff
 
+## 2026-11-18 — VegSAM-style arm + data focus added (for the supervisor meeting at 12:00 on 19 Nov)
+
+- **New arms `rgb_ndvi` (VegSAM-style: RGB into the ViT, NIR only via the adapter) and `rgbi_ndvi` (raw NIR channel +
+  adapter)**; fast batch runs all four arms (2x2). The adapter: NDVI -> patch embed
+  (14x14, to the ViT token grid) -> per-block MLP (1024->64) -> GELU -> shared MLP (64->1024, zero-init) -> added to
+  every ViT block's output (32 blocks; 2.37 M extra trainable params; adapter lr x5, fixed a priori). Verified on the
+  real SAM 3: output at step 0 identical to `rgbi` (max diff 0.0); gradients reach all parts with checkpointing on.
+  Paper read in full (CVPRW 2026): VegSAM adds NDVI at every block, LoRA Q+V rank 4, 4->3 channel fusion module,
+  prompt-free tree token + hierarchical decoder; its own ablation: NDVI adapter ~ +0.3 IoU on top of RGB-NIR input.
+- **Data focus** (`PRIORITY`, `scripts/make_focus.py`): training patches drawn with replacement with weight
+  floor(0.1) + share of priority-class pixels; priority classes prompted first. Default priority 5 6 7 8 10 (water,
+  coniferous, deciduous, brushwood, herbaceous) = my suggestion, NOT a group decision. Toy check: priority pixels seen
+  53 % -> 77 %. Test set unchanged (complete official). Classes are not merged into "other" (kept comparable).
+- **Plan:** fast batch (`OUT=./outputs/fast`, STEPS=2000, 1 seed, 3 arms, TEST_LIMIT=2000) for the meeting; long batch
+  (`OUT=./outputs/long_focus`, STEPS=12000, 3 seeds x 3 arms) in the background. Fast numbers are NOT comparable to the
+  old 4k/12k runs (different steps, focus, test subset); compare within a batch only.
+- **Season check, REAL split (2026-11-19, `scripts/season_check.py`, 21 train + 16 test domains, <=20 patches/domain):** all
+  flights day 124-287 (May - mid Oct), no leaf-off. Train day 124-264 (median 225), test 125-287 (median 208). THREE test
+  domains are later than any train domain: D012-2019 (272), D022-2021 (282), D064-2021 (287); test also has 2022 (D073).
+  Class-mean pseudo-NDVI (8-bit DN) differs a lot between domains (deciduous 0.13-0.42, sd 0.07), but deciduous > herbaceous in
+  37/37 domains (gap 0.11-0.35). r(day, NDVI) = +0.27 conif (p 0.14), +0.20 decid (0.24), +0.12 herb, +0.10 agri: not
+  distinguishable from zero. => date alone does not explain domain differences; check the late test domains in the
+  per-domain report table. `train_report.py` has that table (mIoU of both arms, paired delta + CI, date if `--dates`;
+  run_train.sh passes `$T/season/patch_dates.json` when it exists). Full write-up: docs/technical_nir_training.md 8.7.
+- **KNOWN LIMITATION:** `train_report.py` only builds its comparison sections when a seed has BOTH `rgb` and `rgbi`
+  (`seeds = rgb & rgbi`). A batch of only `rgb` + `rgb_ndvi` runs and evaluates but the report says "no paired comparison"
+  and writes no figures. Always include `rgbi` in `ARMS` (verified: `rgb rgbi rgb_ndvi` gives all comparisons).
+
 ## RESULT 2026-10-28 — 12,000-step runs + NIR diagnostic (4,000-step models)
 
 - **12,000 steps** (`outputs/long/train` on the cluster; report copied to `outputs/long_report/` on the Mac): RGB

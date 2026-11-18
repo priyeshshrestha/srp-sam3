@@ -234,7 +234,7 @@ We trained the same RGB and RGB + NIR models **three times longer** (12,000 step
 3. **Compare with published FLAIR-HUB baselines** on the same official split, so we can say whether 0.63 mIoU is good. (We must check those numbers in the FLAIR-HUB paper first.)
 4. **Look at where NIR still hurts** in the saved results: plowed fields merged into crops (the most-hurt test images in both runs), and lawns vs grassland in the shorter runs.
 5. **Get access to the EU drone data.** This is still our biggest risk for the final phase. Any help here would make a big difference.
-6. Smaller to-dos: check the HRNet recap number (0.580 vs 0.5134); check the VegSAM details in the paper itself; save the code to git.
+6. Smaller to-dos: check the HRNet recap number (0.580 vs 0.5134); save the code to git.
 
 ## 10. What to be careful about when presenting
 

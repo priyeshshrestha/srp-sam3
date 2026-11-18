@@ -38,6 +38,14 @@
 #
 # Configuration (environment variables, all optional):
 #   FLAIR_DATA_DIR   dataset root (FLAIR #1 or FLAIR-HUB, 4+ bands)          [./data]
+#   ARMS             which models to train: rgb | rgbi | rgb_ndvi | rgbi_ndvi   [rgb rgbi]
+#                      rgb_ndvi  = VegSAM-style: the ViT sees RGB only; NIR enters ONLY through an NDVI
+#                                  adapter added after every ViT block
+#                      rgbi_ndvi = raw NIR as a 4th channel AND the NDVI adapter
+#   PRIORITY         FLAIR class ids to focus the TRAINING data on, e.g. "5 6 7 8 10" (water, coniferous,
+#                    deciduous, brushwood, herbaceous). Patches rich in them are drawn more often and those
+#                    classes are prompted first; test set unchanged; reports add the priority-class mIoU   [none]
+#   FOCUS_FLOOR      sampling weight of a patch without priority pixels, relative to an all-priority one's 1  [0.1]
 #   SEEDS            training seeds                                         [0 1 2]
 #   STEPS            optimizer steps per run                                [4000]
 #   BATCH / ACCUM    max images per forward pass / passes per step; effective batch = BATCH x ACCUM [2 / 4]
@@ -70,6 +78,9 @@ T="$OUT/train"
 export PYTHON="${PYTHON:-$(command -v python || command -v python3 || echo python)}"
 export MODEL="${MODEL:-sam3}"
 export SEEDS="${SEEDS:-0 1 2}"
+export ARMS="${ARMS:-rgb rgbi}"
+export PRIORITY="${PRIORITY:-}"
+export FOCUS_FLOOR="${FOCUS_FLOOR:-0.1}"
 export STEPS="${STEPS:-4000}"
 BATCH="${BATCH:-2}"
 ACCUM="${ACCUM:-4}"
@@ -99,6 +110,7 @@ run_job() {   # run_job <tag> <gpu> <batch> <accum>
     local tag="$1" g="$2" b="$3" acc="$4" dir="$T/runs/$1" rc
     local dev; dev="$(dev_for "$g")"
     local -a C; read -r -a C <<< "$(common)"
+    local -a FOCUS=(); [ -n "$PRIORITY" ] && FOCUS=(--focus "$T/focus.json")
     mkdir -p "$dir"
     if [ "$tag" = "zeroshot_rgb" ]; then
         CUDA_VISIBLE_DEVICES="$(gpu_env "$g")" $PYTHON scripts/eval_sam3.py --zero_shot --model "$MODEL" \
@@ -108,7 +120,7 @@ run_job() {   # run_job <tag> <gpu> <batch> <accum>
         local ch="${tag%_s*}" seed="${tag##*_s}"
         CUDA_VISIBLE_DEVICES="$(gpu_env "$g")" $PYTHON scripts/train_sam3.py --model "$MODEL" --steps "$STEPS" \
             --lr "$LR" --prompts "$PROMPTS" --lora_rank "$LORA_RANK" --workers "$WORKERS" "${C[@]}" \
-            --channels "$ch" --seed "$seed" --batch "$b" --accum "$acc" --out "$dir" --device "$dev"
+            --channels "$ch" --seed "$seed" --batch "$b" --accum "$acc" --out "$dir" --device "$dev" ${FOCUS[@]+"${FOCUS[@]}"}
         rc=$?; [ $rc -eq 0 ] || return $rc
         CUDA_VISIBLE_DEVICES="$(gpu_env "$g")" $PYTHON scripts/eval_sam3.py --run "$dir" "${C[@]}" \
             --limit "$TEST_LIMIT" --workers "$WORKERS" --device "$dev"
@@ -249,6 +261,13 @@ say "5. Train/test split (whole domains held out)"
 $PYTHON scripts/make_split.py --root "$FLAIR_DATA_DIR" --out "$T/split.json" --mode "$SPLIT" \
     --test_frac "$TEST_FRAC" || die "split failed (see above)"
 
+if [ -n "$PRIORITY" ]; then
+    say "5b. Training-data focus on priority classes: $PRIORITY"
+    $PYTHON scripts/make_focus.py --root "$FLAIR_DATA_DIR" --split "$T/split.json" --priority $PRIORITY \
+        --floor "$FOCUS_FLOOR" --out "$T/focus.json" --counts_cache "$T/train_class_counts.json" \
+        || die "focus failed (see above)"
+fi
+
 if [ "$MODEL" = "sam3" ]; then
     say "6. SAM 3 weights"
     $PYTHON scripts/preflight.py model --model sam3 --variant facebook/sam3 --checkpoint "" \
@@ -260,7 +279,9 @@ fi
 TRAIN_ARGS=(--model "$MODEL" --steps "$STEPS" --lr "$LR" --prompts "$PROMPTS" --lora_rank "$LORA_RANK" --workers "$WORKERS")
 EFF=$((BATCH * ACCUM))
 MEM="$T/memory.json"
-MEM_KEY="$MODEL p$PROMPTS r$LORA_RANK b$BATCH eff$EFF"
+PROBE_ARM=rgbi; case " $ARMS " in *" rgb_ndvi "*) PROBE_ARM=rgb_ndvi;; esac
+case " $ARMS " in *" rgbi_ndvi "*) PROBE_ARM=rgbi_ndvi;; esac                     # probe the largest arm
+MEM_KEY="$MODEL p$PROMPTS r$LORA_RANK b$BATCH eff$EFF $PROBE_ARM"
 
 say "7. Memory probe (3 training steps + 2 test images; measures what one run needs)"
 if [ -f "$MEM" ] && grep -q "\"key\": \"$MEM_KEY\"" "$MEM"; then
@@ -269,7 +290,7 @@ else
     probe() {   # probe <gpu> <batch> -> exit code of the probe
         rm -rf "$T/probe"
         CUDA_VISIBLE_DEVICES="$(gpu_env "$1")" $PYTHON scripts/train_sam3.py "${TRAIN_ARGS[@]}" "${COMMON[@]}" \
-            --channels rgbi --seed 0 --batch "$2" --accum 1 --out "$T/probe" --probe 3 --device "$(dev_for "$1")"
+            --channels "$PROBE_ARM" --seed 0 --batch "$2" --accum 1 --out "$T/probe" --probe 3 --device "$(dev_for "$1")"
     }
     need=$PROBE_MIN_GB
     while :; do
@@ -320,19 +341,24 @@ EOF
 # ---------------------------------------------------------------------------
 say "8. Training + evaluation (queued onto whichever GPU has room; logs in $T/logs/)"
 JOBS=()
-for s in $SEEDS; do for ch in rgb rgbi; do JOBS+=("${ch}_s${s}"); done; done
+for s in $SEEDS; do for ch in $ARMS; do
+    case "$ch" in rgb|rgbi|rgb_ndvi|rgbi_ndvi) ;; *) die "unknown arm '$ch' in ARMS (use: rgb rgbi rgb_ndvi rgbi_ndvi)";; esac
+    JOBS+=("${ch}_s${s}")
+done; done
 [ "$ZERO_SHOT" = "1" ] && JOBS+=("zeroshot_rgb")
 echo "  runs: ${JOBS[*]}"
 # Existing runs (finished or not) must have been started with the current settings and split.
-$PYTHON - "$T/runs" "$T/split.json" "$MODEL" "$STEPS" "$LR" "$PROMPTS" "$LORA_RANK" "$EFF" "$BAND_ORDER" <<'EOF' || die "existing runs were made with different settings (listed above). Re-run with the old settings, or move $T/runs away to start fresh. Runs are never mixed."
+$PYTHON - "$T/runs" "$T/split.json" "$MODEL" "$STEPS" "$LR" "$PROMPTS" "$LORA_RANK" "$EFF" "$BAND_ORDER" "${PRIORITY:+$T/focus.json}" <<'EOF' || die "existing runs were made with different settings (listed above). Re-run with the old settings, or move $T/runs away to start fresh. Runs are never mixed."
 import glob, json, os, sys
-runs, split, model, steps, lr, prompts, rank, eff, band = sys.argv[1:]
+runs, split, model, steps, lr, prompts, rank, eff, band = sys.argv[1:10]
+focus = sys.argv[10] if len(sys.argv) > 10 else ""
 want = {"model": model, "steps": int(steps), "lr": float(lr), "prompts": int(prompts), "lora_rank": int(rank),
-        "effective_batch": int(eff), "band_order": band, "split_sha": json.load(open(split))["sha"]}
+        "effective_batch": int(eff), "band_order": band, "split_sha": json.load(open(split))["sha"],
+        "focus_sha": json.load(open(focus))["sha"] if focus else ""}
 bad = 0
 for cfg_p in sorted(glob.glob(os.path.join(runs, "*", "config.json"))):
     cfg = json.load(open(cfg_p))
-    diff = {k: (cfg.get(k), v) for k, v in want.items() if cfg.get(k) != v}
+    diff = {k: (cfg.get(k), v) for k, v in want.items() if (cfg.get(k) if cfg.get(k) is not None else "") != v}
     if diff:
         bad += 1
         print(f"  {os.path.basename(os.path.dirname(cfg_p))}: different settings (was, now) {diff}")
@@ -373,7 +399,7 @@ else
     GR=cpu
 fi
 CUDA_VISIBLE_DEVICES="$(gpu_env "$GR")" $PYTHON scripts/train_report.py --runs "${DONE_DIRS[@]}" "${COMMON[@]}" \
-    --out "$T/report" --device "$(dev_for "$GR")" || die "report failed (see above)"
+    --out "$T/report" --dates "$T/season/patch_dates.json" --device "$(dev_for "$GR")" || die "report failed (see above)"
 tar -czf "$OUT/train_report.tar.gz" -C "$T" report
 
 say "Done"

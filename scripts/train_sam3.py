@@ -22,14 +22,16 @@ import torch  # noqa: E402
 import torch.nn.functional as F  # noqa: E402
 from torch.utils.data import DataLoader  # noqa: E402
 
-from train.data import CHANNELS, TrainSchedule, load_split  # noqa: E402
+from train.data import CHANNELS, PATCH_CHANNELS, TrainSchedule, load_focus, load_split, uses_ndvi  # noqa: E402
+from train.sam3_rgbi import CLASSES  # noqa: E402
 from train.sam3_rgbi import PATCH_EMBED, build, load_trainable, normalise, trainable_state  # noqa: E402
 
 # Settings that define a run. A resumed run must match them exactly.
 # (batch x accum may be re-split, e.g. after an out-of-memory probe: the data schedule depends only on
 # their product, so a run can resume with a different split of the same effective batch.)
 RUN_KEYS = ("model", "channels", "seed", "steps", "effective_batch", "lr", "prompts", "lora_rank",
-            "split_sha", "band_order", "precision")
+            "split_sha", "band_order", "precision", "focus_sha")
+ADAPTER_LR_SCALE = 5.0       # NDVI adapter learns faster than LoRA (its output layer starts at zero); fixed a priori
 
 
 def pick_device(name):
@@ -82,12 +84,18 @@ def main():
     ap.add_argument("--log_every", type=int, default=20)
     ap.add_argument("--device", default="auto")
     ap.add_argument("--probe", type=int, default=0)
+    ap.add_argument("--focus", default=None, help="focus.json from scripts/make_focus.py: sample training patches "
+                    "in proportion to their share of priority-class pixels")
     a = ap.parse_args()
 
     split = load_split(a.split)
+    focus = load_focus(a.focus, split) if a.focus else None
     cfg = {k: getattr(a, k) for k in RUN_KEYS if hasattr(a, k)}
     cfg["split_sha"] = split["sha"]
     cfg["effective_batch"] = a.batch * a.accum
+    cfg["focus_sha"] = focus["sha"] if focus else ""
+    cfg["focus_priority"] = focus["priority"] if focus else []
+    cfg["focus_floor"] = focus["floor"] if focus else None
     os.makedirs(a.out, exist_ok=True)
     cfg_path, last_path, final_path = (os.path.join(a.out, f) for f in ("config.json", "last.pt", "final.pt"))
 
@@ -95,7 +103,8 @@ def main():
         if os.path.exists(cfg_path):
             with open(cfg_path) as fh:
                 old = json.load(fh)
-            diff = {k: (old.get(k), cfg[k]) for k in RUN_KEYS if old.get(k) != cfg[k]}
+            norm = lambda v: "" if v is None else v          # runs from before the focus option lack the key
+            diff = {k: (old.get(k), cfg[k]) for k in RUN_KEYS if norm(old.get(k)) != norm(cfg[k])}
             if diff:
                 sys.exit(f"ERROR: {a.out} was started with different settings {diff}. Use a new --out "
                          f"or delete that directory; runs are never mixed.")
@@ -108,17 +117,21 @@ def main():
 
     dev = pick_device(a.device)
     amp = dev == "cuda" and a.precision == "bf16"
-    print(f"  device {dev}  |  bf16 autocast {amp}  |  {a.channels} ({CHANNELS[a.channels]} ch)  |  seed {a.seed}")
+    print(f"  device {dev}  |  bf16 autocast {amp}  |  {a.channels} ({CHANNELS[a.channels]} ch)  |  seed {a.seed}"
+          + (f"  |  focus on classes {focus['priority']} (floor {focus['floor']})" if focus else ""))
 
     torch.manual_seed(a.seed)
-    net = build(a.model, CHANNELS[a.channels], a.lora_rank, seed=a.seed).to(dev)
+    net = build(a.model, PATCH_CHANNELS[a.channels], a.lora_rank, seed=a.seed, ndvi=uses_ndvi(a.channels),
+                input_channels=CHANNELS[a.channels]).to(dev)
     net.enable_checkpointing()
     net.train()
     trainable = [(n, p) for n, p in net.named_parameters() if p.requires_grad]
     print(f"  trainable {sum(p.numel() for _, p in trainable) / 1e6:.2f} M parameters"
           f"  |  LoRA layers {getattr(net, 'n_lora', 0)}")
     groups = [{"params": [p for n, p in trainable if PATCH_EMBED in n], "lr_scale": 0.1},
-              {"params": [p for n, p in trainable if PATCH_EMBED not in n], "lr_scale": 1.0}]
+              {"params": [p for n, p in trainable if n.startswith("ndvi_adapter.")], "lr_scale": ADAPTER_LR_SCALE},
+              {"params": [p for n, p in trainable if PATCH_EMBED not in n and not n.startswith("ndvi_adapter.")],
+               "lr_scale": 1.0}]
     groups = [g for g in groups if g["params"]]
     opt = torch.optim.AdamW(groups, lr=a.lr, weight_decay=1e-4)
 
@@ -133,7 +146,9 @@ def main():
     total = a.probe or a.steps
     per_step = a.batch * a.accum
     ds = TrainSchedule(a.root, split["train"], a.band_order, a.channels, a.seed, n_items=total * per_step,
-                       n_prompts=a.prompts, start_item=step * per_step)
+                       n_prompts=a.prompts, start_item=step * per_step,
+                       weights=focus["w"] if focus else None,
+                       priority_idx=[CLASSES.index(c) for c in focus["priority"]] if focus else None)
     dl = DataLoader(ds, batch_size=a.batch, shuffle=False, num_workers=a.workers,
                     pin_memory=dev == "cuda", persistent_workers=False)
     warmup = max(1, min(200, a.steps // 10))

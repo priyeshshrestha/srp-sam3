@@ -16,6 +16,8 @@ works on the cluster and on a laptop.
 import glob
 import json
 import os
+import re
+import sqlite3
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -102,7 +104,7 @@ def load_patch(root: str, rel_img: str, band_order: str) -> Tuple[np.ndarray, np
 
 
 def build_class_counts(root: str, rel_paths: Sequence[str],
-                       cache: Optional[str] = None) -> Dict[str, Dict[int, int]]:
+                       cache: Optional[str] = None, workers: int = 1) -> Dict[str, Dict[int, int]]:
     """{rel_path: {class_id: pixel_count}} from one pass over the masks (cached to JSON)."""
     if cache and os.path.exists(cache):
         with open(cache) as fh:
@@ -110,13 +112,24 @@ def build_class_counts(root: str, rel_paths: Sequence[str],
         if set(raw) >= set(rel_paths):
             return {p: {int(c): n for c, n in raw[p].items()} for p in rel_paths}
 
-    counts: Dict[str, Dict[int, int]] = {}
-    for i, rel in enumerate(rel_paths):
+    def one(rel):
         mask = read_label(mask_path_for(os.path.join(root, rel)))
         ids, n = np.unique(mask, return_counts=True)
-        counts[rel] = {int(c): int(k) for c, k in zip(ids.tolist(), n.tolist())}
-        if (i + 1) % 1000 == 0:
-            print(f"  indexed {i + 1}/{len(rel_paths)} masks", flush=True)
+        return {int(c): int(k) for c, k in zip(ids.tolist(), n.tolist())}
+
+    counts: Dict[str, Dict[int, int]] = {}
+    if workers > 1:                                    # reading labels is I/O bound: threads are enough
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(workers) as pool:
+            for i, (rel, c) in enumerate(zip(rel_paths, pool.map(one, rel_paths))):
+                counts[rel] = c
+                if (i + 1) % 2000 == 0:
+                    print(f"  indexed {i + 1}/{len(rel_paths)} masks", flush=True)
+    else:
+        for i, rel in enumerate(rel_paths):
+            counts[rel] = one(rel)
+            if (i + 1) % 1000 == 0:
+                print(f"  indexed {i + 1}/{len(rel_paths)} masks", flush=True)
     if cache:
         os.makedirs(os.path.dirname(os.path.abspath(cache)), exist_ok=True)
         with open(cache, "w") as fh:
@@ -126,3 +139,28 @@ def build_class_counts(root: str, rel_paths: Sequence[str],
 
 def domains_of(rel_paths: Sequence[str]) -> Dict[str, str]:
     return {p: domain_of(p) for p in rel_paths}
+
+
+# ------------------------------------------------------------------------ acquisition dates (FLAIR-HUB)
+_HUB_NAME = re.compile(r"(D\d{3,6}-\d{4})_AERIAL_RGBI_(.+)_(\d+-\d+)\.tif$")
+
+
+def hub_patch_id(rel: str) -> Optional[str]:
+    """FLAIR-HUB patch id ('D069-2020_<roi>_<x-y>') of an AERIAL_RGBI patch path; None for other layouts."""
+    m = _HUB_NAME.search(os.path.basename(rel))
+    return f"{m.group(1)}_{m.group(2)}_{m.group(3)}" if m else None
+
+
+def read_aerial_dates(gpkg: str) -> Dict[str, str]:
+    """{patch_id: 'YYYYMMDD'} from a FLAIR-HUB *AERIAL_MTD_DATES.gpkg (per-domain or GLOBAL). Read-only SQLite."""
+    con = sqlite3.connect(f"file:{os.path.abspath(gpkg)}?mode=ro", uri=True)
+    try:
+        tables = [r[0] for r in con.execute("select table_name from gpkg_contents where data_type='features'")]
+        out: Dict[str, str] = {}
+        for tb in tables:
+            cols = {r[1] for r in con.execute(f'pragma table_info("{tb}")')}
+            if {"patch_id", "date"} <= cols:
+                out.update({pid: str(d) for pid, d in con.execute(f'select patch_id, date from "{tb}"')})
+        return out
+    finally:
+        con.close()
